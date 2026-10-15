@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+app/settings.json
+app/pending.json
+app/skipped.json
+app/convert-log.tsv
+tools/ffmpeg
+tools/ffprobe
+tools/ffplay
+tools/HandBrakeCLI
+tools/FFmpeg-LICENSE.txt

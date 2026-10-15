@@ -1,0 +1,16 @@
+HandBrakeCLI
+  HandBrake, GPL-2.0. https://handbrake.fr/
+  The installer uses the official Linux Flatpak fr.handbrake.ghb
+  from Flathub when the tools folder has no HandBrakeCLI binary.
+  https://flathub.org/apps/fr.handbrake.ghb
+
+ffmpeg, ffprobe
+  FFmpeg, GPL-3.0. See FFmpeg-LICENSE.txt after the installer downloads it.
+  The installer downloads a static Linux build from
+  https://johnvansickle.com/ffmpeg/releases/
+  (ffmpeg-release-amd64-static.tar.xz or the arm64 archive)
+  and keeps those binaries in the installed tools folder.
+  That release archive contains ffmpeg and ffprobe. It does not contain ffplay.
+  Compare plays the new file's sound through the desktop audio.
+  The source tree does not contain the binaries.
+  That build is separate from the Windows essentials build used by the Windows program.

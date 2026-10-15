@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Video Dehydrator
+Comment=Shrink videos that are too big for their picture size
+Exec=video-dehydrator
+Icon=video-dehydrator
+Terminal=false
+Categories=AudioVideo;Video;
+StartupNotify=true
