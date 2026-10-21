@@ -1,12 +1,14 @@
 # Video Dehydrator for Linux
 
-This is the Linux copy of Video Dehydrator 1.0.5.1. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
+This is the Linux copy of Video Dehydrator 1.0.7.4. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
+
+The picture rules match Windows 1.0.7.4: the same x265 medium two-pass rates, the same audio copy, and the same checks. A file made on this computer will not be byte-for-byte the same as a file made on the Windows PC. The target rate is the same, so the size and the kind of picture stay the same.
 
 The Windows program stays in the `windows` folder. This copy does not change it.
 
 ## Install
 
-The installer puts the program in your home folder. The first run needs a network connection. It downloads a static FFmpeg build and installs HandBrake 1.11.2 from Flathub. HandBrake's download is large.
+The installer puts the program in your home folder. The first run needs a network connection. It downloads a static FFmpeg build and installs HandBrake from Flathub. HandBrake's download is large. The Windows program ships HandBrake 1.11.2. Flathub may be a later HandBrake, which can change small details of the picture at the same bitrate.
 
 On Ubuntu, the installer checks for `python3`, `python3-venv`, `python3-pip`, `flatpak`, `curl`, `xz-utils`, and `ca-certificates`. It installs any that are missing and asks for your password. It also adds the Flathub remote.
 

@@ -9,13 +9,15 @@ import time
 
 from .engine import (
     Probe, app_version, bloat_decision, budget_gib_per_hour, compare_versions,
-    format_over_ratio, harmless_decode_note, merge_skip_row, over_band_id,
-    over_ratio, owned_plexignore_text, plexignore_lines, remembered_skip,
-    set_budget_picks, size_skip_reason, target_kbps,
+    ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
+    force_convertible, format_force_report, format_over_ratio, format_remaining_time,
+    harmless_decode_note, merge_skip_row, over_band_id, remaining_estimate,
+    space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
+    plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
 from .recycle import (
-    directory_is_empty, make_plan, purge_file, purge_plexignore, remove_verified_empty,
-    stale_child,
+    directory_is_empty, make_plan, purge_enabled, purge_file, purge_plexignore,
+    remove_recycle_copy, remove_verified_empty, set_purge_enabled, stale_child,
 )
 from .store import flatten_rows
 
@@ -55,23 +57,66 @@ def test_rules():
     check(over_band_id(2.9) == 'heavy', 'under 3x is heavy')
     check(over_band_id(3) == 'extreme', '3x is extreme')
     check(over_band_id(0.8) == '', 'under budget is not a band')
-    check(format_over_ratio(2) == '2.0x', 'over format')
+    check(format_over_ratio(2) == '2.00x', 'over format')
+    check(format_over_ratio(1.2) == '1.20x', 'ratio keeps two decimals')
+    check(format_over_ratio(1.004) == '1.004x', 'a ratio just over 1.00 keeps another digit')
     check(format_over_ratio(None) == '', 'blank over format')
+    shrink = bloat_decision(fake_probe(size_bytes=int(1.5 * (1024 ** 3)), video_bitrate=5_000_000))
+    check(shrink['decision'] == 'shrink', 'a picture still above the target is can shrink')
+    check(force_convertible(shrink), 'a can-shrink file can be forced')
+    check(not force_convertible({'decision': 'dv', 'target_kbps': 3000}), 'Dolby Vision cannot be forced')
+    check(estimated_savings_bytes(1000, 400, None) == 600, 'savings before convert')
+    check(estimated_savings_bytes(1000, 400, 1000) is None, 'savings clear after convert')
+    check(space_saved_bytes(400, 1000) == 600, 'space saved after convert')
+    check(format_remaining_time(40) == 'about 40 sec', 'short remaining time')
+    first = remaining_estimate({'task': 1, 'tasks': 2, 'eta_seconds': 40, 'part': 10}, waiting=[])
+    check(first['file_kind'] == 'pass' and 'first pass' in first['text'] and 'estimating' in first['text'], 'first pass has no batch estimate')
+    second = remaining_estimate({'task': 2, 'tasks': 2, 'eta_seconds': 120, 'part': 50}, waiting=[])
+    check(second['have_batch'] and second['file_seconds'] == 150, 'second pass adds the check cushion')
+    report = format_force_report([
+        {'name': 'a.mkv', 'can_convert': True, 'size': 1000, 'estimate': 400, 'estimate_rough': False, 'reason': ''},
+        {'name': 'b.mkv', 'can_convert': False, 'reason': 'Dolby Vision is left alone.', 'size': 0, 'estimate': None},
+    ])
+    check('1 file can be converted.' in report and '1 file will be left alone.' in report, 'force report')
+    set_purge_enabled(False)
+    check(not purge_enabled(), 'purge stayed on')
+    check(remove_recycle_copy('/tmp/library/.vd-originals/Episode.avi', 10) is None, 'a turned-off recycle purge still ran')
+    set_purge_enabled(None)
+    check(purge_enabled(), 'recycle purge was off with no choice stored')
     bloated = bloat_decision(fake_probe(size_bytes=3 * (1024 ** 3), video_bitrate=15000000))
     check(bloated['decision'] == 'bloated' and bloated['target_kbps'] == 3000, '1080p over budget is bloated')
     lean = bloat_decision(fake_probe(size_bytes=int(1.5 * (1024 ** 3)), video_bitrate=2500000))
     check(lean['decision'] == 'lean', '1080p under budget is lean')
-    hevc = bloat_decision(fake_probe(size_bytes=int(2.5 * (1024 ** 3)), video_bitrate=5000000, already_efficient=True))
+    hevc = bloat_decision(fake_probe(size_bytes=int(2.5 * (1024 ** 3)), video_bitrate=2500000, already_efficient=True))
     check(hevc['decision'] == 'lean', 'HEVC under its line is lean')
     dv = bloat_decision(fake_probe(size_bytes=5 * (1024 ** 3), is_dolby_vision=True))
     check(dv['decision'] == 'dv', 'Dolby Vision is left alone')
     check(harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10'), 'equal dts is harmless')
     check(not harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11 >= 10'), 'a backwards timestamp fails')
+    ac3_tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
+    check(trailing_ac3_note(ac3_tail), 'one trailing incomplete AC3 frame is the allowed note')
+    check(not trailing_ac3_note(ac3_tail + ' | [mpeg4 @ 00000001] error while decoding'), 'a picture error stays a failure')
+    check(not trailing_ac3_note(ac3_tail.replace('decode Last', 'decode First')), 'the first window does not use the tail exception')
+    frame = bytearray(768)
+    frame[0] = 0x0B
+    frame[1] = 0x77
+    frame[4] = 20
+    check(ac3_frame_size(bytes(frame), 0) == 768, '192 kbps 48 kHz AC3 frame is 768 bytes')
+    whole = bytes(frame) + bytes(frame)
+    check(not ac3_short_tail(whole), 'a complete AC3 tail is not short')
+    short = bytearray(whole)
+    short.extend(b'\x00' * 288)
+    short[1536] = 0x0B
+    short[1537] = 0x77
+    short[1540] = 20
+    check(ac3_short_tail(bytes(short)), 'a copied AC3 tail that ends mid-frame is short')
+    check(copied_ac3(['ac3'], ['ac3']), 'copied AC3 stays AC3')
+    check(not copied_ac3(['ac3'], ['aac']), 'AC3 re-encoded to AAC is not the tail exception')
     check(size_skip_reason('the new file is not smaller; the new file is not smaller per hour'), 'size skip')
     check(not size_skip_reason('the new file is not smaller; audio could not be copied'), 'mixed failure is not a size skip')
     check(compare_versions('1.0.5.1', 'v1.0.5.1') == 0, 'version prefix')
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
-    check(app_version() == '1.0.5.1', 'app version')
+    check(app_version() == '1.0.7.4', 'app version')
     rows = merge_skip_row([], '/videos/a.mkv', 100, 3000)
     check(remembered_skip(rows, '/videos/a.mkv', 100, 3000), 'a skip was forgotten')
     check(not remembered_skip(rows, '/videos/a.mkv', 100, 2000), 'a lower budget still lists the file')

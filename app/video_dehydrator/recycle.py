@@ -32,6 +32,20 @@ class RecycleBook:
         return [row for row in self.rows if row and not row.get('shown') and row.get('status') in PROBLEM_STATUSES]
 
 
+# None means the engine is running on its own, where the purge stays available.
+# The window sets False until Clear the drive recycle copy is checked.
+_purge_choice = None
+
+
+def set_purge_enabled(enabled):
+    global _purge_choice
+    _purge_choice = None if enabled is None else bool(enabled)
+
+
+def purge_enabled() -> bool:
+    return True if _purge_choice is None else bool(_purge_choice)
+
+
 def result(status, source, recycle_file, message, name):
     return {
         'status': status,
@@ -499,6 +513,8 @@ def purge_plexignore(plan, length: int):
 
 
 def remove_recycle_copy(path: str, length: int, book: RecycleBook = None, allow_local: bool = False, share=None):
+    if not purge_enabled():
+        return None
     name = os.path.basename(path)
     if length <= 0:
         row = result('skipped', path, '', 'The file length was not known.', name)
@@ -515,6 +531,8 @@ def remove_recycle_copy(path: str, length: int, book: RecycleBook = None, allow_
 
 
 def remove_recycled_plexignore(path: str, length: int, book: RecycleBook = None, allow_local: bool = False, share=None):
+    if not purge_enabled():
+        return None
     if length <= 0 or length > 4096:
         return None
     plan = named_plan(path, '.plexignore', allow_local=allow_local, share=share)
@@ -530,6 +548,8 @@ def remove_recycled_plexignore(path: str, length: int, book: RecycleBook = None,
 
 
 def remove_recycled_holding_folder(directory: str, book: RecycleBook = None, allow_local: bool = False, share=None):
+    if not purge_enabled():
+        return None
     plan = directory_plan(directory, allow_local=allow_local, share=share)
     if not plan:
         return

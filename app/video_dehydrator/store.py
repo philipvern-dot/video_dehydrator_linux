@@ -19,6 +19,11 @@ DEFAULTS = {
     'shutdown': False,
     'updatePrompt': '',
     'deleteConfirmVersion': '',
+    'autoAsk': True,
+    'purgeRecycle': False,
+    'recycleAlertMuted': False,
+    'listExtra': 0,
+    'columnOrder': [],
 }
 
 
@@ -38,6 +43,15 @@ def load_settings() -> dict:
     for key in settings:
         if key in payload and payload[key] is not None:
             settings[key] = payload[key]
+    try:
+        settings['listExtra'] = int(settings.get('listExtra') or 0)
+    except (TypeError, ValueError):
+        settings['listExtra'] = 0
+    order = settings.get('columnOrder')
+    settings['columnOrder'] = [str(name) for name in order] if isinstance(order, list) else []
+    settings['autoAsk'] = bool(settings.get('autoAsk', True))
+    settings['purgeRecycle'] = bool(settings.get('purgeRecycle'))
+    settings['recycleAlertMuted'] = bool(settings.get('recycleAlertMuted'))
     return settings
 
 

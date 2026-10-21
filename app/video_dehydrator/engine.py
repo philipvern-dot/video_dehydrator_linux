@@ -7,6 +7,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -250,10 +251,15 @@ def over_band_id(ratio) -> str:
 def format_over_ratio(ratio) -> str:
     if ratio is None or ratio == '':
         return ''
-    return f'{float(ratio):.1f}x'
+    value = float(ratio)
+    places = 2
+    if value > 1:
+        while places < 4 and round(value + 1e-12, places) <= 1:
+            places += 1
+    return f'{value:.{places}f}x'
 
 
-def handbrake_fraction(line: str):
+def handbrake_progress(line: str):
     match = re.search(r'Encoding:\s*task\s+(\d+)\s+of\s+(\d+),\s*([\d.]+)\s*%', line or '')
     if not match:
         return None
@@ -267,7 +273,203 @@ def handbrake_fraction(line: str):
     if task > tasks:
         task = tasks
     overall = ((task - 1) + (part / 100.0)) / tasks * 100.0
-    return max(0.0, min(100.0, overall))
+    overall = max(0.0, min(100.0, overall))
+    eta = -1.0
+    eta_match = re.search(r'ETA\s+(\d+)h(\d+)m(\d+)s', line or '')
+    if eta_match:
+        eta = int(eta_match.group(1)) * 3600 + int(eta_match.group(2)) * 60 + int(eta_match.group(3))
+    return {
+        'task': task,
+        'tasks': tasks,
+        'part': part,
+        'overall': overall,
+        'eta_seconds': eta,
+    }
+
+
+def handbrake_fraction(line: str):
+    progress = handbrake_progress(line)
+    if progress is None:
+        return None
+    return progress['overall']
+
+
+def pixel_seconds(width, height, duration_sec) -> float:
+    try:
+        width = int(width)
+        height = int(height)
+        duration_sec = float(duration_sec)
+    except (TypeError, ValueError):
+        return 0.0
+    if width <= 0 or height <= 0 or duration_sec <= 0:
+        return 0.0
+    if math.isnan(duration_sec) or math.isinf(duration_sec):
+        return 0.0
+    return float(width) * float(height) * duration_sec
+
+
+def encode_cushion_seconds() -> int:
+    return 30
+
+
+def _round_away(value: float) -> int:
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
+def format_remaining_time(seconds) -> str:
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return ''
+    if seconds < 0 or math.isnan(seconds) or math.isinf(seconds):
+        return ''
+    rounded = _round_away(seconds)
+    if rounded < 60:
+        if rounded < 1:
+            rounded = 1
+        return f'about {rounded} sec'
+    minutes = _round_away(seconds / 60.0)
+    if minutes < 90:
+        if minutes < 1:
+            minutes = 1
+        return f'about {minutes} min'
+    hours = minutes // 60
+    mins = minutes % 60
+    if mins == 0:
+        return f'about {hours} hr'
+    return f'about {hours} hr {mins} min'
+
+
+def mean_sample(values) -> float:
+    total = 0.0
+    count = 0
+    for value in values or []:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number <= 0 or math.isnan(number) or math.isinf(number):
+            continue
+        total += number
+        count += 1
+    if count == 0:
+        return 0.0
+    return total / count
+
+
+def encode_rate(live_rate, finished_rates) -> float:
+    try:
+        live = float(live_rate)
+    except (TypeError, ValueError):
+        live = 0.0
+    if live > 0 and not math.isnan(live) and not math.isinf(live):
+        return live
+    return mean_sample(finished_rates)
+
+
+def live_encode_rate(pass1_sec, pass_elapsed_sec, pass_fraction, pixels) -> float:
+    try:
+        pass1_sec = float(pass1_sec)
+        pass_elapsed_sec = float(pass_elapsed_sec)
+        pass_fraction = float(pass_fraction)
+        pixels = float(pixels)
+    except (TypeError, ValueError):
+        return 0.0
+    if pass1_sec <= 0 or pixels <= 0:
+        return 0.0
+    if pass_elapsed_sec < 8 or pass_fraction < 0.05:
+        return 0.0
+    if pass_fraction > 1:
+        pass_fraction = 1
+    pass2 = pass_elapsed_sec / pass_fraction
+    encode = pass1_sec + pass2
+    if encode <= 0 or math.isnan(encode) or math.isinf(encode):
+        return 0.0
+    return encode / pixels
+
+
+def remaining_estimate(progress, pass_elapsed_sec=0, pass1_sec=0, pass_ratio=0, rate8=0, rate10=0, waiting=None, phase='encode') -> dict:
+    cushion = float(encode_cushion_seconds())
+    file_kind = 'none'
+    file_seconds = 0.0
+    if phase == 'check':
+        file_kind = 'check'
+        file_seconds = cushion
+    elif progress is not None and float(progress.get('eta_seconds', -1)) >= 0:
+        last_pass = int(progress.get('task') or 0) >= int(progress.get('tasks') or 0)
+        if last_pass:
+            file_kind = 'full'
+            file_seconds = float(progress['eta_seconds']) + cushion
+        elif pass_ratio and float(pass_ratio) > 0:
+            so_far = float(pass_elapsed_sec)
+            if so_far < 0:
+                so_far = 0
+            total_pass1 = so_far + float(progress['eta_seconds'])
+            file_kind = 'full'
+            file_seconds = float(progress['eta_seconds']) + (total_pass1 * float(pass_ratio)) + cushion
+        else:
+            file_kind = 'pass'
+            file_seconds = float(progress['eta_seconds'])
+    have_batch = False
+    batch_seconds = 0.0
+    if file_kind in ('full', 'check'):
+        have_batch = True
+        batch_seconds = file_seconds
+        for item in waiting or []:
+            if not item:
+                continue
+            known = bool(item.get('known', True))
+            pixels = float(item.get('pixel_seconds') or 0)
+            if not known or pixels <= 0:
+                have_batch = False
+                break
+            rate = float(rate10 if item.get('ten_bit') else rate8)
+            if rate <= 0 or math.isnan(rate) or math.isinf(rate):
+                have_batch = False
+                break
+            batch_seconds += (pixels * rate) + cushion
+    if file_kind == 'pass':
+        pass_no = int(progress.get('task') or 1) if progress else 1
+        pass_name = 'first pass' if pass_no < 2 else f'pass {pass_no}'
+        file_text = f'{pass_name}, {format_remaining_time(file_seconds)} left'
+    elif file_kind in ('full', 'check'):
+        file_text = f'{format_remaining_time(file_seconds)} left'
+    else:
+        file_text = 'estimating'
+    batch_text = format_remaining_time(batch_seconds) if have_batch else 'estimating'
+    return {
+        'file_kind': file_kind,
+        'file_seconds': file_seconds,
+        'batch_seconds': batch_seconds if have_batch else 0,
+        'have_batch': have_batch,
+        'text': f'This file: {file_text}. Estimated time remaining: {batch_text}',
+    }
+
+
+def estimated_savings_bytes(size_bytes, estimate_bytes, old_bytes) -> int | None:
+    if old_bytes:
+        return None
+    try:
+        size = int(size_bytes or 0)
+        estimate = int(estimate_bytes or 0)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0 or estimate <= 0 or estimate >= size:
+        return None
+    return size - estimate
+
+
+def space_saved_bytes(size_bytes, old_bytes) -> int | None:
+    try:
+        old = int(old_bytes or 0)
+        new = int(size_bytes or 0)
+    except (TypeError, ValueError):
+        return None
+    if old <= 0 or new <= 0 or old <= new:
+        return None
+    return old - new
 
 
 def is_encode_progress_line(line: str) -> bool:
@@ -317,8 +519,25 @@ def stream_bitrate(stream: dict, duration_sec: float) -> int:
     return 0
 
 
+# AC-3 frame size in 16-bit words. Row is frmsizecod 0..37.
+# Column is 48 kHz, 44.1 kHz, 32 kHz.
+AC3_FRAME_WORDS = (
+    (64, 69, 96), (64, 70, 96), (80, 87, 120), (80, 88, 120),
+    (96, 104, 144), (96, 105, 144), (112, 121, 168), (112, 122, 168),
+    (128, 139, 192), (128, 140, 192), (160, 174, 240), (160, 175, 240),
+    (192, 208, 288), (192, 209, 288), (224, 243, 336), (224, 244, 336),
+    (256, 278, 384), (256, 279, 384), (320, 348, 480), (320, 349, 480),
+    (384, 417, 576), (384, 418, 576), (448, 487, 672), (448, 488, 672),
+    (512, 557, 768), (512, 558, 768), (640, 696, 960), (640, 697, 960),
+    (768, 835, 1152), (768, 836, 1152), (896, 975, 1344), (896, 976, 1344),
+    (1024, 1114, 1536), (1024, 1115, 1536), (1152, 1253, 1728), (1152, 1254, 1728),
+    (1280, 1393, 1920), (1280, 1394, 1920),
+)
+
+
 @dataclass
 class Probe:
+    path: str = ''
     duration_sec: float = 0.0
     size_bytes: int = 0
     video_codec: str = ''
@@ -382,6 +601,7 @@ def probe_from_json(payload: dict, file_path: str = '') -> Probe:
     field = str(video.get('field_order') or '')
     codec = str(video.get('codec_name') or '')
     return Probe(
+        path=file_path or '',
         duration_sec=duration,
         size_bytes=size,
         video_codec=codec,
@@ -441,6 +661,19 @@ def estimated_bytes(probe: Probe, target: int):
     return int(round(estimate))
 
 
+def shrinkable_picture(probe: Probe, target, estimate) -> bool:
+    if probe is None or not target or int(target) <= 0:
+        return False
+    if probe.video_bitrate <= 0 or probe.size_bytes <= 0 or probe.duration_sec <= 0:
+        return False
+    if estimate is None or int(estimate) <= 0 or int(estimate) >= int(probe.size_bytes):
+        return False
+    file_bps = (probe.size_bytes * 8.0) / probe.duration_sec
+    if file_bps <= 0 or probe.video_bitrate < (file_bps * 0.4):
+        return False
+    return probe.video_bitrate > (int(target) * 1000.0 * 1.05)
+
+
 def bloat_decision(probe: Probe) -> dict:
     scale = picture_scale(probe.width, probe.height)
     target = target_kbps(probe.width, probe.height)
@@ -464,8 +697,12 @@ def bloat_decision(probe: Probe) -> dict:
         decision = 'nodur'
         reason = 'The size per hour could not be read.'
     elif rate < budget:
-        decision = 'lean'
-        reason = 'Under the budget for this picture size.'
+        if shrinkable_picture(probe, target, estimate):
+            decision = 'shrink'
+            reason = 'The file is under the budget line. The picture is still above the target rate, so a new file should be smaller.'
+        else:
+            decision = 'lean'
+            reason = 'Under the budget for this picture size.'
     else:
         file_bps = (probe.size_bytes * 8.0) / probe.duration_sec
         target_bps = (target or 0) * 1000.0
@@ -486,6 +723,132 @@ def bloat_decision(probe: Probe) -> dict:
         'estimate_bytes': estimate,
         'estimate_rough': bool(estimate is not None and estimate > 0 and probe.video_bitrate <= 0),
     }
+
+
+def force_convertible(decision) -> bool:
+    if not decision:
+        return False
+    kind = str(decision.get('decision') or '')
+    if kind in ('dv', 'nodur', 'nopicture'):
+        return False
+    try:
+        return int(decision.get('target_kbps') or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def force_video_paths(path: str, recurse: bool) -> list:
+    if not path or not str(path).strip():
+        return []
+    if os.path.isfile(path):
+        return [os.path.abspath(path)] if is_video_file(path) else []
+    if not os.path.isdir(path):
+        return []
+    found = []
+
+    def walk(directory, nested):
+        leaf = os.path.basename(directory.rstrip('\\/'))
+        if leaf == '.vd-originals':
+            return
+        try:
+            with os.scandir(directory) as scan:
+                names = list(scan)
+        except OSError:
+            return
+        for entry in names:
+            if entry.is_file(follow_symlinks=False) and is_video_file(entry.path):
+                found.append(entry.path)
+            elif nested and entry.is_dir(follow_symlinks=False):
+                walk(entry.path, True)
+
+    walk(path, recurse)
+    return found
+
+
+def format_force_report(files) -> str:
+    ready = 0
+    blocked = 0
+    known_now = 0
+    known_next = 0
+    rough = False
+    unknown = 0
+    grows = 0
+    lines = []
+    shown = 0
+    for file in files or []:
+        if not file:
+            continue
+        name = file.get('name') or os.path.basename(str(file.get('path') or ''))
+        if not file.get('can_convert'):
+            blocked += 1
+            if shown < 8:
+                lines.append(f"{name} is left alone. {file.get('reason') or ''}".rstrip())
+                shown += 1
+            continue
+        ready += 1
+        try:
+            size = int(file.get('size') or 0)
+        except (TypeError, ValueError):
+            size = 0
+        estimate = file.get('estimate')
+        has_estimate = False
+        try:
+            estimate = int(estimate) if estimate not in (None, '') else 0
+        except (TypeError, ValueError):
+            estimate = 0
+        if estimate > 0:
+            has_estimate = True
+        if file.get('estimate_rough'):
+            rough = True
+        note = name
+        if not has_estimate or size <= 0:
+            unknown += 1
+            note += ' has no size estimate.'
+        else:
+            known_now += size
+            known_next += estimate
+            if estimate >= size:
+                grows += 1
+                note += ' may not get smaller.'
+            else:
+                note += ' could save about ' + format_byte_size(size - estimate) + '.'
+                if file.get('estimate_rough'):
+                    note += ' That guess can run high.'
+        if shown < 8:
+            lines.append(note)
+            shown += 1
+    total = ready + blocked
+    if total == 0:
+        return 'No video files were found.'
+    word = 'file' if ready == 1 else 'files'
+    text = f'{ready} {word} can be converted.'
+    if known_now > 0 and known_next > 0:
+        text += ' They are ' + format_byte_size(known_now) + ' now. The estimate is ' + format_byte_size(known_next) + '.'
+        if known_next < known_now:
+            text += ' About ' + format_byte_size(known_now - known_next) + ' smaller.'
+        else:
+            text += ' The estimate is not smaller.'
+    if unknown == 1:
+        text += ' 1 file has no size estimate.'
+    elif unknown > 1:
+        text += f' {unknown} files have no size estimate.'
+    if grows == 1:
+        text += ' 1 file may not get smaller. A larger result is thrown away.'
+    elif grows > 1:
+        text += f' {grows} files may not get smaller. A larger result is thrown away.'
+    if rough:
+        text += ' A guess with no picture rate can run high.'
+    if blocked == 1:
+        text += ' 1 file will be left alone.'
+    elif blocked > 1:
+        text += f' {blocked} files will be left alone.'
+    text += ' This test reads the files. It does not encode.'
+    hidden = total - shown
+    if lines:
+        text += '\n\n' + '\n'.join(lines)
+    if hidden > 0:
+        text += '\n' + f'and {hidden} more.'
+    return text
 
 
 def encoder_name(probe: Probe) -> str:
@@ -515,6 +878,133 @@ def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, e
     else:
         arguments += ['--no-comb-detect', '--no-deinterlace', '--no-decomb', '--no-bwdif']
     return arguments
+
+
+def ac3_frame_size(data: bytes, offset: int) -> int:
+    if data is None or offset < 0 or offset + 5 > len(data):
+        return 0
+    if data[offset] != 0x0B or data[offset + 1] != 0x77:
+        return 0
+    fscod = data[offset + 4] >> 6
+    code = data[offset + 4] & 0x3F
+    if fscod > 2 or code > 37:
+        return 0
+    words = AC3_FRAME_WORDS[code][fscod]
+    if words <= 0:
+        return 0
+    return words * 2
+
+
+def ac3_short_tail(data: bytes) -> bool:
+    if not data or len(data) < 16:
+        return False
+    start = -1
+    for index in range(0, len(data) - 5):
+        size = ac3_frame_size(data, index)
+        if size < 64:
+            continue
+        nxt = index + size
+        if nxt >= len(data):
+            continue
+        if ac3_frame_size(data, nxt) > 0:
+            start = index
+            break
+    if start < 0:
+        return False
+    pos = start
+    frames = 0
+    while pos < len(data):
+        size = ac3_frame_size(data, pos)
+        if size < 64:
+            return False
+        if pos + size > len(data):
+            return frames >= 2
+        if pos + size == len(data):
+            return False
+        frames += 1
+        pos += size
+    return False
+
+
+def trailing_ac3_note(text: str) -> bool:
+    if text is None or not str(text).strip():
+        return False
+    lines = [part.strip() for part in re.split(r'\s+\|\s+|\r?\n', text) if part and part.strip()]
+    if not lines:
+        return False
+    incomplete = 0
+    patterns = (
+        re.compile(r'^\[ac3 @ [0-9A-Fa-fx]+\] incomplete frame$'),
+        re.compile(r'^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] corrupt decoded frame$'),
+        re.compile(r'^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Error processing packet in decoder: Invalid data found when processing input$'),
+        re.compile(r'^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Error submitting packet to decoder: Invalid data found when processing input$'),
+        re.compile(r'^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Task finished with error code: -1094995529 \(Invalid data found when processing input\)$'),
+        re.compile(r'^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Terminating thread with return code -1094995529 \(Invalid data found when processing input\)$'),
+    )
+    prefix = re.compile(r'^decode Last exit=(-?\d+)\s+(.*)$')
+    for line in lines:
+        body = line
+        match = prefix.match(body)
+        if match:
+            if int(match.group(1)) == 0:
+                return False
+            body = match.group(2)
+        if patterns[0].match(body):
+            incomplete += 1
+            continue
+        if any(pattern.match(body) for pattern in patterns[1:]):
+            continue
+        return False
+    return incomplete == 1
+
+
+def copied_ac3(source_codecs, output_codecs) -> bool:
+    source = list(source_codecs or [])
+    output = list(output_codecs or [])
+    found = False
+    for index, left in enumerate(source):
+        if str(left).strip().lower() != 'ac3':
+            continue
+        right = output[index] if index < len(output) else ''
+        if str(right).strip().lower() != 'ac3':
+            return False
+        found = True
+    return found
+
+
+def source_ac3_short_tail(ffmpeg: str, file_path: str, codecs) -> bool:
+    if not ffmpeg or not file_path or not os.path.isfile(file_path):
+        return False
+    indexes = [index for index, name in enumerate(list(codecs or [])) if str(name).strip().lower() == 'ac3']
+    if not indexes:
+        return False
+    for index in indexes:
+        temp_path = ''
+        try:
+            handle = tempfile.NamedTemporaryFile(prefix='vd-ac3-', suffix='.ac3', delete=False)
+            temp_path = handle.name
+            handle.close()
+            code, _out, _err = run_captured([
+                ffmpeg, '-y', '-hide_banner', '-nostdin', '-v', 'error',
+                '-sseof', '-3', '-i', file_path,
+                '-map', f'0:a:{index}',
+                '-c', 'copy', '-f', 'ac3', temp_path,
+            ])
+            if code != 0 or not os.path.isfile(temp_path):
+                return False
+            with open(temp_path, 'rb') as raw:
+                data = raw.read()
+            if not ac3_short_tail(data):
+                return False
+        except Exception:
+            return False
+        finally:
+            if temp_path and os.path.isfile(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+    return True
 
 
 def harmless_decode_note(text: str) -> bool:
@@ -653,7 +1143,17 @@ def test_encoded_file(ffmpeg, ffprobe, temp, source_probe: Probe, handbrake_log:
         reasons.append(first['detail'])
     last = decode_window(ffmpeg, temp, out.duration_sec, 'Last')
     if not last['ok']:
-        reasons.append(last['detail'])
+        # A VirtualDub-style AVI can end in the middle of an AC3 frame.
+        # Copying that track keeps the short tail. Accept one incomplete
+        # frame at the end when every copied AC3 track already ended that way.
+        source_path = getattr(source_probe, 'path', '') or ''
+        trailing = (
+            trailing_ac3_note(last['detail'])
+            and copied_ac3(source_probe.audio_codecs, out.audio_codecs)
+            and source_ac3_short_tail(ffmpeg, source_path, source_probe.audio_codecs)
+        )
+        if not trailing:
+            reasons.append(last['detail'])
     reasons.extend(audio_change_reasons(source_probe.audio_codecs, out.audio_codecs, allow_audio_reencode))
     if out.sub_count < source_probe.sub_count:
         reasons.append(f'subtitles dropped from {source_probe.sub_count} to {out.sub_count}')
