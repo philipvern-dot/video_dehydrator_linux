@@ -36,7 +36,7 @@ apt_installed() {
 }
 
 install_missing_packages() {
-  local packages=(python3 python3-venv python3-pip flatpak curl xz-utils ca-certificates)
+  local packages=(python3 python3-venv python3-pip flatpak curl xz-utils ca-certificates numactl)
   local missing=()
   local pkg
   for pkg in "${packages[@]}"; do

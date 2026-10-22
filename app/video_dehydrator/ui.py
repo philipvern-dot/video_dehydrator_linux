@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import math
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -17,7 +18,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -32,10 +33,11 @@ from .engine import (
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
     linux_release_is_update,
     encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
-    format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report,
+    format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     is_encode_progress_line, is_video_file, larger_file_note,
-    encode_rate, live_encode_rate, mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor,
+    batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
+    mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
     over_band_id, over_ratio, pixel_seconds, probe_file, remaining_estimate,
     remembered_skip, remove_kept_original, remove_skip_row, replace_plan,
     replace_with_encode, run_lines, set_budget_picks, size_skip_reason,
@@ -231,40 +233,8 @@ def show_criteria(row) -> list:
     return found
 
 
-class ConvertWorker(QThread):
-    activity = Signal(str, str)
-    progress = Signal(float)
-    file_update = Signal(object)
-    finished_job = Signal(object)
-    eta = Signal(str)
-
-    def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False):
-        super().__init__()
-        self.rows = rows
-        self.tools = tools
-        self.reencode = reencode
-        self.delete_original = delete_original
-        self.detailed = detailed
-        self.skips = list(skips)
-        self.cancel = cancel
-        self.force = force
-        self.stop_after = threading.Event()
-        self.book = RecycleBook()
-        self.batch = uuid.uuid4().hex
-        self.saved = 0
-        self.file_index = 0
-        self.rates8 = []
-        self.rates10 = []
-        self.live8 = []
-        self.live10 = []
-        self.ratios = []
-        self.file_samples = []
-        self.batch_samples = []
-        self.shown_at = None
-        self.shown_key = ''
-        self._reset_clock()
-
-    def _reset_clock(self):
+class EncodeSlot:
+    def __init__(self):
         self.pass_started = time.monotonic()
         self.pass1_sec = 0.0
         self.task = 0
@@ -279,6 +249,75 @@ class ConvertWorker(QThread):
         self.batch_samples = []
         self.shown_at = None
         self.shown_key = ''
+        self.percent = 0.0
+        self.file_seconds = 0.0
+        self.name = ''
+
+
+class ConvertWorker(QThread):
+    activity = Signal(str, str)
+    progress = Signal(float)
+    file_update = Signal(object)
+    finished_job = Signal(object)
+    eta = Signal(str)
+
+    def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1):
+        super().__init__()
+        self.rows = rows
+        self.tools = tools
+        self.reencode = reencode
+        self.delete_original = delete_original
+        self.detailed = detailed
+        self.skips = list(skips)
+        self.cancel = cancel
+        self.force = force
+        self.jobs = job_count(jobs)
+        self.stop_after = threading.Event()
+        self.book = RecycleBook()
+        self.batch = uuid.uuid4().hex
+        self.saved = 0
+        self.file_index = 0
+        self.rates8 = []
+        self.rates10 = []
+        self.ratios = []
+        self._tls = threading.local()
+        self._state = threading.Lock()
+        self._resume = threading.Event()
+        self._resume.set()
+        self._queue = []
+        self._active = 0
+        self._finished = 0
+        self._stopped = False
+        self._running_percents = {}
+        self._file_eta = {}
+        self._eta_shown_at = None
+        self._eta_shown_key = ''
+
+    def _slot(self) -> EncodeSlot:
+        slot = getattr(self._tls, 'slot', None)
+        if slot is None:
+            slot = EncodeSlot()
+            self._tls.slot = slot
+        return slot
+
+    def _reset_clock(self):
+        slot = self._slot()
+        slot.pass_started = time.monotonic()
+        slot.pass1_sec = 0.0
+        slot.task = 0
+        slot.progress_info = None
+        slot.checking = False
+        slot.remembered = False
+        slot.ten_bit = False
+        slot.pixels = 0.0
+        slot.live8 = []
+        slot.live10 = []
+        slot.file_samples = []
+        slot.batch_samples = []
+        slot.shown_at = None
+        slot.shown_key = ''
+        slot.percent = 0.0
+        slot.file_seconds = 0.0
 
     def _add_sample(self, bucket, value):
         try:
@@ -291,44 +330,49 @@ class ConvertWorker(QThread):
         del bucket[:-8]
 
     def _remember_finished(self):
-        if self.remembered or self.task < 2 or self.pass1_sec < 1 or self.pixels <= 0:
+        slot = self._slot()
+        if slot.remembered or slot.task < 2 or slot.pass1_sec < 1 or slot.pixels <= 0:
             return
-        pass2 = time.monotonic() - self.pass_started
+        pass2 = time.monotonic() - slot.pass_started
         if pass2 < 1:
             return
-        rate = (self.pass1_sec + pass2) / self.pixels
-        ratio = pass2 / self.pass1_sec
-        if self.ten_bit:
-            self._add_sample(self.rates10, rate)
-        else:
-            self._add_sample(self.rates8, rate)
-        self._add_sample(self.ratios, ratio)
-        self.remembered = True
+        rate = (slot.pass1_sec + pass2) / slot.pixels
+        ratio = pass2 / slot.pass1_sec
+        with self._state:
+            if slot.ten_bit:
+                self._add_sample(self.rates10, rate)
+            else:
+                self._add_sample(self.rates8, rate)
+            self._add_sample(self.ratios, ratio)
+        slot.remembered = True
 
     def _note_pass(self, info):
+        slot = self._slot()
         task = int(info.get('task') or 0)
-        if self.task >= 1 and task > self.task and self.task == 1 and task >= 2:
-            self.pass1_sec = max(0.0, time.monotonic() - self.pass_started)
-            self.pass_started = time.monotonic()
-        elif task > self.task:
-            self.pass_started = time.monotonic()
-        if task > self.task:
-            self.live8 = []
-            self.live10 = []
-            self.task = task
-        self.progress_info = info
+        if slot.task >= 1 and task > slot.task and slot.task == 1 and task >= 2:
+            slot.pass1_sec = max(0.0, time.monotonic() - slot.pass_started)
+            slot.pass_started = time.monotonic()
+        elif task > slot.task:
+            slot.pass_started = time.monotonic()
+        if task > slot.task:
+            slot.live8 = []
+            slot.live10 = []
+            slot.task = task
+        slot.progress_info = info
 
     def _chosen_rate(self, ten):
-        finished = self.rates10 if ten else self.rates8
+        slot = self._slot()
+        with self._state:
+            finished = list(self.rates10 if ten else self.rates8)
         live = 0.0
         part = 0.0
-        info = self.progress_info
-        on_last = info and int(info.get('task') or 0) >= int(info.get('tasks') or 0) and self.task >= 2
-        if on_last and ten == self.ten_bit and not self.checking:
+        info = slot.progress_info
+        on_last = info and int(info.get('task') or 0) >= int(info.get('tasks') or 0) and slot.task >= 2
+        if on_last and ten == slot.ten_bit and not slot.checking:
             part = float(info.get('part') or 0) / 100.0
-            live = live_encode_rate(self.pass1_sec, time.monotonic() - self.pass_started, part, self.pixels)
+            live = live_encode_rate(slot.pass1_sec, time.monotonic() - slot.pass_started, part, slot.pixels)
             if live > 0:
-                bucket = self.live10 if ten else self.live8
+                bucket = slot.live10 if ten else slot.live8
                 self._add_sample(bucket, live)
                 live = median_sample(bucket)
         return encode_rate(live, finished, part)
@@ -336,8 +380,10 @@ class ConvertWorker(QThread):
     def _waiting(self):
         if self.stop_after.is_set():
             return []
+        with self._state:
+            queued = list(self._queue)
         waiting = []
-        for row in self.rows[self.file_index + 1:]:
+        for row in queued:
             pixels = pixel_seconds(row.get('width'), row.get('height'), row.get('duration'))
             waiting.append({
                 'pixel_seconds': pixels,
@@ -346,11 +392,37 @@ class ConvertWorker(QThread):
             })
         return waiting
 
+    def _queued_seconds(self, rate8, rate10):
+        cushion = float(encode_cushion_seconds())
+        total = 0.0
+        for item in self._waiting():
+            if not item.get('known'):
+                return None
+            rate = float(rate10 if item.get('ten_bit') else rate8)
+            pixels = float(item.get('pixel_seconds') or 0)
+            if rate <= 0 or pixels <= 0 or math.isnan(rate) or math.isinf(rate):
+                return None
+            total += (pixels * rate) + cushion
+        return total
+
     def _publish_key(self, phase, estimate):
-        task = int((self.progress_info or {}).get('task') or 0)
+        slot = self._slot()
+        task = int((slot.progress_info or {}).get('task') or 0)
         stop = 'stop' if self.stop_after.is_set() else 'run'
         batch = 'ready' if estimate.get('have_batch') else 'wait'
-        return f"{phase}|{estimate.get('file_kind')}|{batch}|{stop}|{task}"
+        return f"{phase}|{estimate.get('file_kind')}|{batch}|{stop}|{task}|{slot.name}"
+
+    def _set_progress(self, value):
+        slot = self._slot()
+        slot.percent = float(value)
+        if self.jobs <= 1:
+            self.progress.emit(value)
+            return
+        with self._state:
+            self._running_percents[id(slot)] = slot.percent
+            total = max(1, len(self.rows))
+            overall = (self._finished * 100.0 + sum(self._running_percents.values())) / total
+        self.progress.emit(overall)
 
     def _window_add(self, bucket, value):
         try:
@@ -363,67 +435,139 @@ class ConvertWorker(QThread):
         del bucket[:-160]
 
     def _emit_eta(self):
-        phase = 'check' if self.checking else 'encode'
+        slot = self._slot()
+        phase = 'check' if slot.checking else 'encode'
+        rate8 = self._chosen_rate(False)
+        rate10 = self._chosen_rate(True)
+        with self._state:
+            ratio = mean_sample(self.ratios)
+        solo = self.jobs <= 1
         estimate = remaining_estimate(
-            self.progress_info,
-            pass_elapsed_sec=time.monotonic() - self.pass_started,
-            pass1_sec=self.pass1_sec,
-            pass_ratio=mean_sample(self.ratios),
-            rate8=self._chosen_rate(False),
-            rate10=self._chosen_rate(True),
-            waiting=self._waiting(),
+            slot.progress_info,
+            pass_elapsed_sec=time.monotonic() - slot.pass_started,
+            pass1_sec=slot.pass1_sec,
+            pass_ratio=ratio,
+            rate8=rate8,
+            rate10=rate10,
+            waiting=self._waiting() if solo else [],
             phase=phase,
         )
         key = self._publish_key(phase, estimate)
-        key_changed = key != self.shown_key
+        key_changed = key != slot.shown_key
         if key_changed:
-            self.file_samples = []
-            self.batch_samples = []
+            slot.file_samples = []
+            slot.batch_samples = []
         if float(estimate.get('file_seconds') or 0) > 0:
-            self._window_add(self.file_samples, estimate['file_seconds'])
-        if estimate.get('have_batch') and float(estimate.get('batch_seconds') or 0) > 0:
-            self._window_add(self.batch_samples, estimate['batch_seconds'])
-        file_seconds = median_sample(self.file_samples) or float(estimate.get('file_seconds') or 0)
+            self._window_add(slot.file_samples, estimate['file_seconds'])
+        if solo and estimate.get('have_batch') and float(estimate.get('batch_seconds') or 0) > 0:
+            self._window_add(slot.batch_samples, estimate['batch_seconds'])
+        file_seconds = median_sample(slot.file_samples) or float(estimate.get('file_seconds') or 0)
+        slot.file_seconds = file_seconds
         batch_seconds = float(estimate.get('batch_seconds') or 0)
-        if estimate.get('have_batch'):
-            median_batch = median_sample(self.batch_samples)
+        if solo and estimate.get('have_batch'):
+            median_batch = median_sample(slot.batch_samples)
             if median_batch > 0:
                 batch_seconds = median_batch
-        text = format_eta_text(
-            self.progress_info, estimate.get('file_kind'), file_seconds, batch_seconds, bool(estimate.get('have_batch')),
-        )
-        since = 999.0 if self.shown_at is None else time.monotonic() - self.shown_at
+        if solo:
+            text = format_eta_text(
+                slot.progress_info, estimate.get('file_kind'), file_seconds, batch_seconds, bool(estimate.get('have_batch')),
+            )
+        else:
+            file_bit = format_eta_text(slot.progress_info, estimate.get('file_kind'), file_seconds, 0, False)
+            file_bit = file_bit.split('. Estimated time remaining:')[0]
+            label = slot.name or 'File'
+            with self._state:
+                self._file_eta[id(slot)] = (label, file_bit, file_seconds)
+                running = [item[2] for item in self._file_eta.values()]
+                parts = [f'{item[0]}: {item[1].replace("This file: ", "")}' for item in self._file_eta.values()]
+            queued = self._queued_seconds(rate8, rate10)
+            have_batch = queued is not None and all(item > 0 for item in running)
+            wall = batch_wall_seconds(running, queued or 0, self.jobs) if have_batch else 0
+            batch_text = format_remaining_time(wall) if have_batch else 'estimating'
+            text = f"{' '.join(parts)}. Estimated time remaining: {batch_text}"
+        since = 999.0 if slot.shown_at is None else time.monotonic() - slot.shown_at
+        if self.jobs > 1:
+            since = 999.0 if self._eta_shown_at is None else time.monotonic() - self._eta_shown_at
         if key_changed or since >= 30:
             self.eta.emit(text)
-            self.shown_at = time.monotonic()
-            self.shown_key = key
+            slot.shown_at = time.monotonic()
+            slot.shown_key = key
+            if self.jobs > 1:
+                self._eta_shown_at = slot.shown_at
+                self._eta_shown_key = key
             if not key_changed:
-                self.file_samples = []
-                self.batch_samples = []
+                slot.file_samples = []
+                slot.batch_samples = []
                 if file_seconds > 0:
-                    self._window_add(self.file_samples, file_seconds)
-                if estimate.get('have_batch') and batch_seconds > 0:
-                    self._window_add(self.batch_samples, batch_seconds)
+                    self._window_add(slot.file_samples, file_seconds)
+                if solo and estimate.get('have_batch') and batch_seconds > 0:
+                    self._window_add(slot.batch_samples, batch_seconds)
+
+    def _take_row(self):
+        while True:
+            if self.cancel.is_set():
+                return None
+            with self._state:
+                if self.stop_after.is_set():
+                    self._stopped = True
+                    if self._active == 0:
+                        return None
+                elif self._queue:
+                    self._active += 1
+                    return self._queue.pop(0)
+                elif self._active == 0:
+                    return None
+            self._resume.wait(0.2)
+            self._resume.clear()
+
+    def _finish_active(self):
+        with self._state:
+            self._active = max(0, self._active - 1)
+            self._finished += 1
+            self._running_percents.pop(id(self._slot()), None)
+            self._file_eta.pop(id(self._slot()), None)
+        self._resume.set()
 
     def run(self):
-        stopped = False
-        for index, row in enumerate(self.rows):
-            if self.cancel.is_set():
-                break
-            self.file_index = index
-            self.convert_row(row)
-            if self.cancel.is_set():
-                break
-            if self.stop_after.is_set():
-                stopped = True
-                break
+        lanes = 2 if self.jobs >= 2 and len(self.rows) > 1 else 1
+        self.jobs = lanes
+        with self._state:
+            self._queue = list(self.rows)
+            self._active = 0
+            self._finished = 0
+            self._stopped = False
+            self._running_percents = {}
+            self._file_eta = {}
+        if lanes == 2:
+            self.activity.emit('Encoding 2 files at a time.', 'text')
+
+        def work(node):
+            self._tls.slot = EncodeSlot()
+            self._tls.node = node
+            while True:
+                row = self._take_row()
+                if row is None:
+                    return
+                try:
+                    self.convert_row(row)
+                finally:
+                    self._finish_active()
+
+        if lanes == 1:
+            work(0)
+        else:
+            threads = [threading.Thread(target=work, args=(node,), name=f'vd-encode-{node}') for node in range(lanes)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
         self.eta.emit('')
         self.finished_job.emit({
             'book': self.book,
             'skips': self.skips,
             'saved': self.saved,
             'cancelled': self.cancel.is_set(),
-            'stopped_after': stopped,
+            'stopped_after': self._stopped and not self.cancel.is_set(),
             'batch': self.batch,
         })
 
@@ -438,11 +582,14 @@ class ConvertWorker(QThread):
         source = row['source'] or row['path']
         previous = row['status']
         verb = 'Forcing' if self.force else 'Converting'
-        self.activity.emit(f"{verb} {os.path.basename(source)}.", 'text')
+        slot = self._slot()
+        slot.name = os.path.basename(source)
+        self.activity.emit(f"{verb} {slot.name}.", 'text')
         row['status'] = 'Converting'
         self.file_update.emit(row)
-        self.progress.emit(0)
         self._reset_clock()
+        slot.name = os.path.basename(source)
+        self._set_progress(0)
         self._emit_eta()
         if self.cancel.is_set():
             self._restore_status(row, previous)
@@ -465,12 +612,13 @@ class ConvertWorker(QThread):
             self.activity.emit(f"Left {os.path.basename(source)} alone. {row['reason']}", 'text')
             self.file_update.emit(row)
             return
+        slot = self._slot()
         row['ten_bit'] = encoder_name(probe) == 'x265_10bit'
         row['width'] = probe.width
         row['height'] = probe.height
         row['duration'] = probe.duration_sec
-        self.ten_bit = bool(row['ten_bit'])
-        self.pixels = pixel_seconds(probe.width, probe.height, probe.duration_sec)
+        slot.ten_bit = bool(row['ten_bit'])
+        slot.pixels = pixel_seconds(probe.width, probe.height, probe.duration_sec)
         plan = replace_plan(source)
         if plan['blocked']:
             row['status'] = 'Failed'
@@ -482,7 +630,12 @@ class ConvertWorker(QThread):
         os.makedirs(plan['hold_dir'], exist_ok=True)
         encoder = encoder_name(probe)
         kbps = target_kbps(probe.width, probe.height)
-        args = handbrake_arguments(source, plan['temp'], probe, kbps, encoder, self.reencode)
+        pool = 8 if self.jobs >= 2 else 0
+        args = handbrake_arguments(source, plan['temp'], probe, kbps, encoder, self.reencode, pool)
+        command = encode_command(
+            str(self.tools['handbrake']), args, self.jobs, int(getattr(self._tls, 'node', 0) or 0),
+            numa_node_count(), shutil.which('numactl') is not None,
+        )
         log_lines = []
 
         def on_line(line):
@@ -490,12 +643,12 @@ class ConvertWorker(QThread):
             info = handbrake_progress(line)
             if info is not None:
                 self._note_pass(info)
-                self.progress.emit(info['overall'])
+                self._set_progress(info['overall'])
                 self._emit_eta()
             elif self.detailed and line and not is_encode_progress_line(line):
                 self.activity.emit(line, 'dim')
 
-        code, _joined = run_lines([str(self.tools['handbrake'])] + args, on_line, self.cancel)
+        code, _joined = run_lines(command, on_line, self.cancel)
         handbrake_log = '\n'.join(log_lines)
         if self.cancel.is_set():
             if os.path.isfile(plan['temp']):
@@ -505,7 +658,7 @@ class ConvertWorker(QThread):
             self.file_update.emit(row)
             return
         self._remember_finished()
-        self.checking = True
+        self._slot().checking = True
         self._emit_eta()
         checked = test_encoded_file(
             str(self.tools['ffmpeg']), str(self.tools['ffprobe']), plan['temp'], probe, handbrake_log, self.reencode,
@@ -521,7 +674,8 @@ class ConvertWorker(QThread):
                 row['status'] = 'Skipped'
                 row['checked'] = False
                 row['reason'] = note or checked['reason']
-                self.skips = merge_skip_row(self.skips, source, probe.size_bytes, kbps or 0)
+                with self._state:
+                    self.skips = merge_skip_row(self.skips, source, probe.size_bytes, kbps or 0)
                 append_convert_log('SKIP', row['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
                 self.activity.emit('Skipped. ' + row['reason'], 'text')
             else:
@@ -533,7 +687,8 @@ class ConvertWorker(QThread):
             self.file_update.emit(row)
             return
         try:
-            swap = replace_with_encode(source, plan['temp'], self.delete_original, self.book)
+            with self._state:
+                swap = replace_with_encode(source, plan['temp'], self.delete_original, self.book)
         except Exception as exc:
             row['status'] = 'Failed'
             row['reason'] = str(exc)
@@ -549,7 +704,8 @@ class ConvertWorker(QThread):
         row['old_bytes'] = swap['old_bytes']
         row['size'] = swap['new_bytes']
         row['estimate'] = None
-        self.saved += max(0, swap['old_bytes'] - swap['new_bytes'])
+        with self._state:
+            self.saved += max(0, swap['old_bytes'] - swap['new_bytes'])
         if swap['deleted']:
             row['status'] = 'Original deleted'
             row['pending_id'] = ''
@@ -561,9 +717,10 @@ class ConvertWorker(QThread):
             row['batch'] = self.batch
             row['checked'] = False
             append_convert_log('KEPT', 'ok', source, swap['new_path'], swap['kept_path'], swap['old_bytes'], swap['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-        self.skips = remove_skip_row(self.skips, source)
+        with self._state:
+            self.skips = remove_skip_row(self.skips, source)
         self.activity.emit(f"Finished {row['name']}.", 'ok')
-        self.progress.emit(100)
+        self._set_progress(100)
         self.file_update.emit(row)
 
 
@@ -642,6 +799,69 @@ class ForceWorker(QThread):
         self.finished_walk.emit({'cancelled': False, 'files': files})
 
 
+def _check_mark_path() -> str:
+    folder = Path(tempfile.gettempdir()) / 'video-dehydrator'
+    folder.mkdir(exist_ok=True)
+    path = folder / 'check.png'
+    if not path.is_file():
+        pix = QPixmap(18, 18)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        pen = QPen(QColor('#ffffff'))
+        pen.setWidth(3)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(4, 10, 8, 14)
+        painter.drawLine(8, 14, 15, 4)
+        painter.end()
+        pix.save(str(path), 'PNG')
+    return str(path).replace('\\', '/')
+
+
+def control_style() -> str:
+    mark = _check_mark_path()
+    return f'''
+    QPushButton {{
+        background: #f8fafc;
+        color: #111827;
+        border: 1px solid #64748b;
+        border-bottom: 3px solid #334155;
+        border-radius: 6px;
+        padding: 5px 12px;
+    }}
+    QPushButton:hover {{ background: #e2e8f0; }}
+    QPushButton:pressed {{
+        background: #cbd5e1;
+        border-bottom: 1px solid #334155;
+        margin-top: 2px;
+        padding-top: 7px;
+        padding-bottom: 3px;
+    }}
+    QPushButton:disabled {{
+        color: #94a3b8;
+        background: #e5e7eb;
+        border: 1px solid #cbd5e1;
+        border-bottom: 3px solid #cbd5e1;
+    }}
+    QTableWidget::indicator {{
+        width: 18px;
+        height: 18px;
+        border: 2px solid #111827;
+        border-radius: 4px;
+        background: #ffffff;
+    }}
+    QTableWidget::indicator:hover {{
+        border: 2px solid #1d4ed8;
+        background: #dbeafe;
+    }}
+    QTableWidget::indicator:checked {{
+        background: #1d4ed8;
+        border: 2px solid #1e3a8a;
+        image: url({mark});
+    }}
+    '''
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -683,7 +903,7 @@ class MainWindow(QMainWindow):
 
     def _build(self):
         page = QWidget()
-        page.setStyleSheet('background:#eef1f4; color:#111827;')
+        page.setStyleSheet('background:#eef1f4; color:#111827;' + control_style())
         self.setCentralWidget(page)
         root = QVBoxLayout(page)
         root.setContentsMargins(16, 12, 16, 12)
@@ -762,6 +982,7 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.itemChanged.connect(self.on_item_changed)
+        self.table.itemSelectionChanged.connect(self._on_selection)
         header.sectionClicked.connect(self.sort_column)
         header.sectionMoved.connect(self._column_moved)
         self._restore_columns()
@@ -854,6 +1075,16 @@ class MainWindow(QMainWindow):
         batch.addWidget(self.stop_after_button)
         batch.addWidget(self.continue_button)
         batch.addWidget(self.force_button)
+        self.jobs_box = QComboBox()
+        self.jobs_box.addItem('1', 1)
+        self.jobs_box.addItem('2', 2)
+        saved_jobs = job_count(self.settings.get('jobs') or 1)
+        jobs_index = self.jobs_box.findData(saved_jobs)
+        self.jobs_box.setCurrentIndex(jobs_index if jobs_index >= 0 else 0)
+        self.jobs_box.currentIndexChanged.connect(self.persist)
+        self.jobs_box.setToolTip('Encode one file, or two files at the same time. Two jobs keep each encode on one processor.')
+        batch.addWidget(QLabel('Jobs at once'))
+        batch.addWidget(self.jobs_box)
         batch.addStretch(1)
         batch_wrap = QWidget()
         batch_wrap.setLayout(batch)
@@ -916,6 +1147,7 @@ class MainWindow(QMainWindow):
             'shutdown': self.shutdown.isChecked(),
             'budgets': budget_pick_pack(),
             'purgeRecycle': self.recycle.isChecked(),
+            'jobs': job_count(self.jobs_box.currentData()),
             'listExtra': int(self.settings.get('listExtra') or 0),
             'columnOrder': self._column_names(),
         })
@@ -935,6 +1167,8 @@ class MainWindow(QMainWindow):
             self.clear_skips_button: 'Forget files skipped because the new copy was larger. Scan again to list them.',
             self.scan_button: 'List videos that are too big for their picture size.',
             self.convert_button: 'Shrink the checked bloated, can-shrink, failed, and skipped files.',
+            self.jobs_box: 'Encode one file, or two files at the same time. Two jobs keep each encode on one processor.',
+            self.delete_button: 'Delete the original of the highlighted Ready to delete file, or every checked one.',
             self.force_button: 'Convert a file or folder even when it is under the budget.',
             self.cancel_button: 'Stop the scan or the file that is converting.',
             self.stop_after_button: 'Finish this file, then stop. The rest stay checked.',
@@ -1290,6 +1524,7 @@ class MainWindow(QMainWindow):
             return
         chosen = [row for row in self.rows if row['checked'] and row['status'] in CONVERTIBLE]
         if not chosen:
+            self.status.setText('Check a file, then click Optimize.')
             return
         if missing_tools():
             QMessageBox.warning(self, 'Video Dehydrator', 'FFmpeg and HandBrake need to be in the tools folder.')
@@ -1310,6 +1545,7 @@ class MainWindow(QMainWindow):
         self.worker = ConvertWorker(
             chosen, self.tools, self.reencode.isChecked(), self.auto.isChecked(),
             self.detailed.isChecked(), self.skips, self.cancel, force=force,
+            jobs=job_count(self.jobs_box.currentData()),
         )
         self.worker.activity.connect(self.log)
         self.worker.progress.connect(lambda value: self.progress.setValue(int(value)))
@@ -1369,13 +1605,14 @@ class MainWindow(QMainWindow):
             return
         worker.stop_after.set()
         self.status.setText('Stopping after the current file')
-        self.log('Stopping after the current file.', 'text')
+        self.log('Stopping after the files already encoding.', 'text')
 
     def request_continue(self):
         worker = self.worker
         if self.work != 'encode' or worker is None:
             return
         worker.stop_after.clear()
+        worker._resume.set()
         self.status.setText('Converting...')
         self.log('Continuing the rest of this batch.', 'text')
 
@@ -1595,44 +1832,48 @@ class MainWindow(QMainWindow):
             return False
         return compare_versions(saved, app_version()) == 0
 
+    def _on_selection(self):
+        if self.loading:
+            return
+        self._refresh()
+
     def delete_originals(self):
-        chosen = [row for row in self.rows if row['checked'] and row['status'] == 'Ready to delete' and row.get('kept')]
+        if self.work != 'idle':
+            return
+        chosen = delete_targets(self.rows, self.selected_row())
         if not chosen:
+            QMessageBox.information(self, 'Video Dehydrator', 'Select a file marked Ready to delete.')
             return
         if not self.delete_confirm_hidden():
-            dialog = QDialog(self)
-            dialog.setWindowTitle('Video Dehydrator')
-            layout = QVBoxLayout(dialog)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle('Video Dehydrator')
             word = 'original' if len(chosen) == 1 else 'originals'
-            label = QLabel(
+            names = '\n'.join(row.get('name') or os.path.basename(str(row.get('kept') or '')) for row in chosen[:8])
+            box.setText(
                 f"Delete {len(chosen)} {word}?\n\nThe new smaller files stay where the originals were. "
                 "The #recycle copy is removed only when Clear the drive recycle copy is on. "
-                "The .plexignore from that convert is removed when it only hides the holding folder."
+                "The .plexignore from that convert is removed when it only hides the holding folder.\n\n"
+                + names
             )
-            label.setWordWrap(True)
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+            box.button(QMessageBox.Yes).setText('Delete')
+            box.button(QMessageBox.Cancel).setText('Cancel')
+            box.setDefaultButton(QMessageBox.Cancel)
             hide = QCheckBox("Don't show this in the future")
-            hint = QLabel('This question comes back when a new version of the program is installed.')
-            buttons = QHBoxLayout()
-            delete = QPushButton('Delete')
-            cancel = QPushButton('Cancel')
-            buttons.addStretch(1)
-            buttons.addWidget(delete)
-            buttons.addWidget(cancel)
-            layout.addWidget(label)
-            layout.addWidget(hide)
-            layout.addWidget(hint)
-            layout.addLayout(buttons)
-            chosen_delete = {'ok': False, 'hide': False}
-            def accept():
-                chosen_delete['ok'] = True
-                chosen_delete['hide'] = hide.isChecked()
-                dialog.accept()
-            delete.clicked.connect(accept)
-            cancel.clicked.connect(dialog.reject)
-            dialog.exec()
-            if not chosen_delete['ok']:
+            hide.setToolTip('This question comes back when a new version of the program is installed.')
+            box.setCheckBox(hide)
+            box.setWindowModality(Qt.ApplicationModal)
+            box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.status.setText('Answer the question to delete the original.')
+            box.show()
+            box.raise_()
+            box.activateWindow()
+            answer = box.exec()
+            if answer != QMessageBox.Yes:
+                self.status.setText('The original was kept.')
                 return
-            if chosen_delete['hide']:
+            if hide.isChecked():
                 self.settings['deleteConfirmVersion'] = app_version()
                 self.persist()
         book = RecycleBook()
@@ -2229,7 +2470,11 @@ class MainWindow(QMainWindow):
         self.stop_after_button.setEnabled(encoding)
         self.continue_button.setEnabled(encoding)
         self.force_button.setEnabled((not busy) and not missing_tools())
-        self.delete_button.setEnabled((not busy) and any(row['checked'] and row['status'] == 'Ready to delete' for row in self.rows))
+        selected = self.selected_row()
+        selected_ready = bool(selected and selected.get('status') == 'Ready to delete' and selected.get('kept'))
+        checked_ready = any(row['checked'] and row['status'] == 'Ready to delete' and row.get('kept') for row in self.rows)
+        self.delete_button.setEnabled((not busy) and (checked_ready or selected_ready))
+        self.jobs_box.setEnabled(not busy)
         self.compare_button.setEnabled(not busy)
         self.undo_button.setEnabled((not busy) and any(os.path.isfile(str(item.get('kept') or '')) for item in self.pending))
         self.shutdown.setEnabled(not busy)

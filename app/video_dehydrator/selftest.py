@@ -8,8 +8,8 @@ import tempfile
 import time
 
 from .engine import (
-    Probe, app_version, bloat_decision, budget_gib_per_hour, compare_versions,
-    linux_release_is_update,
+    Probe, app_version, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
+    delete_targets, encode_command, job_count, linux_release_is_update,
     ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
     encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
     median_sample,
@@ -125,7 +125,16 @@ def test_rules():
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
-    check(app_version() == '1.0.8', 'app version')
+    check(app_version() == '1.0.9', 'app version')
+    check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
+    ready = {'checked': False, 'status': 'Ready to delete', 'kept': '/tmp/old.mkv', 'name': 'old.mkv'}
+    other = {'checked': True, 'status': 'Ready to delete', 'kept': '/tmp/b.mkv', 'name': 'b.mkv'}
+    check(delete_targets([ready], ready) == [ready], 'a highlighted original can be deleted')
+    check(delete_targets([ready, other], ready) == [other], 'checked originals come before the highlight')
+    check(delete_targets([{'checked': True, 'status': 'Bloated', 'kept': ''}], None) == [], 'a bloated row is not deleted')
+    check(batch_wall_seconds([100, 50], 30, 2) == 90, 'two jobs share the remaining time')
+    check(encode_command('HandBrakeCLI', ['-i', 'a'], 1, 0, 2, True) == ['HandBrakeCLI', '-i', 'a'], 'one job is not pinned')
+    check(encode_command('HandBrakeCLI', ['-i', 'a'], 2, 1, 2, True)[0] == 'numactl', 'two jobs can pin a processor')
     rows = merge_skip_row([], '/videos/a.mkv', 100, 3000)
     check(remembered_skip(rows, '/videos/a.mkv', 100, 3000), 'a skip was forgotten')
     check(not remembered_skip(rows, '/videos/a.mkv', 100, 2000), 'a lower budget still lists the file')

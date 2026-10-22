@@ -894,7 +894,7 @@ def encoder_name(probe: Probe) -> str:
     return 'x265'
 
 
-def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, encoder: str, reencode_audio: bool) -> list:
+def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, encoder: str, reencode_audio: bool, thread_pool: int = 0) -> list:
     fallback = 'av_aac' if reencode_audio else 'none'
     arguments = [
         '-i', source, '-o', temp, '--format', 'av_mkv', '--encoder', encoder,
@@ -914,7 +914,67 @@ def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, e
         arguments += ['--comb-detect', 'default', '--decomb']
     else:
         arguments += ['--no-comb-detect', '--no-deinterlace', '--no-decomb', '--no-bwdif']
+    if thread_pool and int(thread_pool) > 0:
+        arguments += ['--encopts', f'pools={int(thread_pool)}']
     return arguments
+
+
+def job_count(value) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return 2 if number >= 2 else 1
+
+
+def delete_targets(rows, selected=None) -> list:
+    chosen = [
+        row for row in (rows or [])
+        if row and row.get('checked') and row.get('status') == 'Ready to delete' and row.get('kept')
+    ]
+    if chosen:
+        return chosen
+    if selected and selected.get('status') == 'Ready to delete' and selected.get('kept'):
+        return [selected]
+    return []
+
+
+def batch_wall_seconds(running_seconds, queued_seconds, jobs) -> float:
+    lanes = job_count(jobs)
+    running = []
+    for item in running_seconds or []:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and not math.isnan(number) and not math.isinf(number):
+            running.append(number)
+    try:
+        queued = float(queued_seconds or 0)
+    except (TypeError, ValueError):
+        queued = 0
+    if queued < 0 or math.isnan(queued) or math.isinf(queued):
+        queued = 0
+    return (sum(running) + queued) / lanes
+
+
+def numa_node_count() -> int:
+    root = Path('/sys/devices/system/node')
+    if not root.is_dir():
+        return 1
+    count = 0
+    for child in root.iterdir():
+        if child.name.startswith('node') and child.name[4:].isdigit():
+            count += 1
+    return max(1, count)
+
+
+def encode_command(handbrake: str, arguments, jobs: int, node: int, numa_nodes: int, have_numactl: bool) -> list:
+    command = [str(handbrake)] + list(arguments or [])
+    if job_count(jobs) < 2 or not have_numactl or int(numa_nodes) < 2:
+        return command
+    bound = int(node) % int(numa_nodes)
+    return ['numactl', f'--cpunodebind={bound}', f'--membind={bound}'] + command
 
 
 def ac3_frame_size(data: bytes, offset: int) -> int:
