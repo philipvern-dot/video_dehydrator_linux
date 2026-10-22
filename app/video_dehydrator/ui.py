@@ -1253,39 +1253,37 @@ class MainWindow(QMainWindow):
     def auto_ask(self) -> bool:
         if not self.auto.isChecked() or self.settings.get('autoAsk') is False:
             return True
-        dialog = QDialog(self)
-        dialog.setWindowTitle('Video Dehydrator')
-        layout = QVBoxLayout(dialog)
-        label = QLabel(
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle('Video Dehydrator')
+        box.setText(
             "Auto is on.\n\nAfter each file checks out, its original is deleted. The new file stays in the original's place. "
             "There will be nothing left to compare. The #recycle copy is removed only when Clear the drive recycle copy is on. "
             "The .plexignore from that convert is removed when it only hides the holding folder."
         )
-        label.setWordWrap(True)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.button(QMessageBox.Yes).setText('Convert')
+        box.button(QMessageBox.Cancel).setText('Cancel')
+        box.setDefaultButton(QMessageBox.Yes)
         hide = QCheckBox('Stop asking')
         hide.setToolTip('Stop opening this warning. Cancel leaves it on.')
-        buttons = QHBoxLayout()
-        convert = QPushButton('Convert')
-        cancel = QPushButton('Cancel')
-        convert.setToolTip('Convert, and delete each original after it checks out.')
-        cancel.setToolTip('Leave the files alone.')
-        buttons.addStretch(1)
-        buttons.addWidget(convert)
-        buttons.addWidget(cancel)
-        layout.addWidget(label)
-        layout.addWidget(hide)
-        layout.addLayout(buttons)
-        chosen = {'ok': False}
-        def accept():
-            chosen['ok'] = True
-            dialog.accept()
-        convert.clicked.connect(accept)
-        cancel.clicked.connect(dialog.reject)
-        dialog.exec()
-        if chosen['ok'] and hide.isChecked():
+        box.setCheckBox(hide)
+        box.setWindowModality(Qt.ApplicationModal)
+        box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.status.setText('Answer the question to start Optimize.')
+        self.log('Answer the question to start Optimize.', 'text')
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        answer = box.exec()
+        if answer != QMessageBox.Yes:
+            self.status.setText('Optimize did not start.')
+            self.log('Optimize did not start.', 'text')
+            return False
+        if hide.isChecked():
             self.settings['autoAsk'] = False
             self.persist()
-        return chosen['ok']
+        return True
 
     def convert(self):
         if self.work != 'idle':
@@ -2062,6 +2060,7 @@ class MainWindow(QMainWindow):
         if 0 <= index < len(shown):
             shown[index]['checked'] = item.checkState() == Qt.Checked
             self.update_savings()
+            self._refresh()
 
     def add_table_row(self, row):
         index = self.table.rowCount()
