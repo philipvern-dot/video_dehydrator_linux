@@ -359,14 +359,47 @@ def mean_sample(values) -> float:
     return total / count
 
 
-def encode_rate(live_rate, finished_rates) -> float:
+def median_sample(values) -> float:
+    kept = []
+    for value in values or []:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number <= 0 or math.isnan(number) or math.isinf(number):
+            continue
+        kept.append(number)
+    if not kept:
+        return 0.0
+    kept.sort()
+    mid = len(kept) // 2
+    if len(kept) % 2 == 1:
+        return kept[mid]
+    return (kept[mid - 1] + kept[mid]) / 2.0
+
+
+def encode_rate(live_rate, finished_rates, pass_fraction=1.0) -> float:
+    finished = mean_sample(finished_rates)
     try:
         live = float(live_rate)
     except (TypeError, ValueError):
         live = 0.0
-    if live > 0 and not math.isnan(live) and not math.isinf(live):
+    if math.isnan(live) or math.isinf(live) or live <= 0:
+        live = 0.0
+    if live <= 0:
+        return finished
+    if finished <= 0:
         return live
-    return mean_sample(finished_rates)
+    try:
+        fraction = float(pass_fraction)
+    except (TypeError, ValueError):
+        fraction = 1.0
+    if math.isnan(fraction) or fraction < 0:
+        fraction = 0.0
+    if fraction > 1:
+        fraction = 1.0
+    live_weight = 0.25 if fraction < 0.15 else 0.5
+    return (live * live_weight) + (finished * (1.0 - live_weight))
 
 
 def live_encode_rate(pass1_sec, pass_elapsed_sec, pass_fraction, pixels) -> float:
@@ -430,6 +463,16 @@ def remaining_estimate(progress, pass_elapsed_sec=0, pass1_sec=0, pass_ratio=0, 
                 have_batch = False
                 break
             batch_seconds += (pixels * rate) + cushion
+    return {
+        'file_kind': file_kind,
+        'file_seconds': file_seconds,
+        'batch_seconds': batch_seconds if have_batch else 0,
+        'have_batch': have_batch,
+        'text': format_eta_text(progress, file_kind, file_seconds, batch_seconds, have_batch),
+    }
+
+
+def format_eta_text(progress, file_kind, file_seconds, batch_seconds, have_batch) -> str:
     if file_kind == 'pass':
         pass_no = int(progress.get('task') or 1) if progress else 1
         pass_name = 'first pass' if pass_no < 2 else f'pass {pass_no}'
@@ -439,13 +482,7 @@ def remaining_estimate(progress, pass_elapsed_sec=0, pass1_sec=0, pass_ratio=0, 
     else:
         file_text = 'estimating'
     batch_text = format_remaining_time(batch_seconds) if have_batch else 'estimating'
-    return {
-        'file_kind': file_kind,
-        'file_seconds': file_seconds,
-        'batch_seconds': batch_seconds if have_batch else 0,
-        'have_batch': have_batch,
-        'text': f'This file: {file_text}. Estimated time remaining: {batch_text}',
-    }
+    return f'This file: {file_text}. Estimated time remaining: {batch_text}'
 
 
 def estimated_savings_bytes(size_bytes, estimate_bytes, old_bytes) -> int | None:
@@ -1489,6 +1526,17 @@ def version_numbers(text: str):
     if match.group(4) is not None:
         numbers.append(int(match.group(4)))
     return numbers
+
+
+def linux_release_is_update(tag: str, current: str, asset) -> bool:
+    newer = compare_versions(tag, current)
+    if newer is None or newer <= 0:
+        return False
+    if not isinstance(asset, dict):
+        return False
+    name = str(asset.get('name') or '').lower()
+    url = str(asset.get('url') or '')
+    return 'linux' in name and name.endswith(('.tar.gz', '.tar.xz', '.run')) and bool(url)
 
 
 def compare_versions(left: str, right: str):

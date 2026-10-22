@@ -33,7 +33,7 @@ SECTIONS = [
     (
         'Converting',
         "Optimize shrinks every checked file whose status is Bloated, Can shrink, Failed, or Skipped. One file is encoded at a time. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest checked. Continue keeps going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is under the budget. Test savings estimates the savings first. Convert now skips that estimate. A result that is not smaller is still thrown away. Dolby Vision is still left alone.\n\n"
-        "While a file is converting, a line under the activity shows how long this file has left and the estimated time remaining for the rest of the batch. On the first pass of the first file, the batch stays on estimating. 10-bit files are timed apart from 8-bit files.\n\n"
+        "While a file is converting, a line under the activity shows how long this file has left and the estimated time remaining for the rest of the batch. On the first pass of the first file, the batch stays on estimating. 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts.\n\n"
         "The new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the new file is not smaller, the row is marked Skipped and later scans leave it off the list while the file size and budget stay the same. Clear skips forgets those marks.\n\n"
         "Show detailed activity lists each encode step. The activity box does not add a line for each percent. The bar along the bottom still shows the percent.\n\n"
         "Shutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off.",
@@ -75,7 +75,7 @@ SECTIONS = [
     ),
     (
         'Updates',
-        "The program checks for a newer published release when it opens. Check for updates looks again. The published file today is the Windows installer. This Linux copy does not download that file. Install a newer Linux folder when one is offered.\n\n"
+        "The program checks the Linux releases on GitHub when it opens. Check for updates looks again. Update downloads the Linux archive and runs its installer.\n\n"
         "Report a bug opens a GitHub page. This program does not send the report. You submit it on the GitHub page. Include latest activity adds the latest lines from the activity box, which can include folder paths.\n\n"
         "Donate opens https://ko-fi.com/philipvern. The program stays free.",
     ),

@@ -9,8 +9,10 @@ import time
 
 from .engine import (
     Probe, app_version, bloat_decision, budget_gib_per_hour, compare_versions,
+    linux_release_is_update,
     ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
-    force_convertible, format_force_report, format_over_ratio, format_remaining_time,
+    encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
+    median_sample,
     harmless_decode_note, merge_skip_row, over_band_id, remaining_estimate,
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
@@ -69,6 +71,11 @@ def test_rules():
     check(estimated_savings_bytes(1000, 400, 1000) is None, 'savings clear after convert')
     check(space_saved_bytes(400, 1000) == 600, 'space saved after convert')
     check(format_remaining_time(40) == 'about 40 sec', 'short remaining time')
+    check(median_sample([10, 40, 12]) == 12, 'a spike does not move the median')
+    check(abs(encode_rate(4, [2], 0.05) - 2.5) < 0.001, 'an early live rate is a quarter of the blend')
+    check(abs(encode_rate(4, [2], 0.5) - 3) < 0.001, 'a later live rate shares the blend')
+    check(encode_rate(0, [2, 4]) == 3, 'no live rate uses the finished average')
+    check(encode_rate(4, []) == 4, 'no finished rate uses the live rate')
     first = remaining_estimate({'task': 1, 'tasks': 2, 'eta_seconds': 40, 'part': 10}, waiting=[])
     check(first['file_kind'] == 'pass' and 'first pass' in first['text'] and 'estimating' in first['text'], 'first pass has no batch estimate')
     second = remaining_estimate({'task': 2, 'tasks': 2, 'eta_seconds': 120, 'part': 50}, waiting=[])
@@ -116,7 +123,9 @@ def test_rules():
     check(not size_skip_reason('the new file is not smaller; audio could not be copied'), 'mixed failure is not a size skip')
     check(compare_versions('1.0.5.1', 'v1.0.5.1') == 0, 'version prefix')
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
-    check(app_version() == '1.0.7.4', 'app version')
+    check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
+    check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
+    check(app_version() == '1.0.8', 'app version')
     rows = merge_skip_row([], '/videos/a.mkv', 100, 3000)
     check(remembered_skip(rows, '/videos/a.mkv', 100, 3000), 'a skip was forgotten')
     check(not remembered_skip(rows, '/videos/a.mkv', 100, 2000), 'a lower budget still lists the file')

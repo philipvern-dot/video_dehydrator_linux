@@ -133,12 +133,19 @@ fi
 "$venv_python" -m pip install --upgrade pip || true
 "$venv_python" -m pip install -r "$ROOT/requirements.txt"
 
+ffmpeg_release="7.0.2"
 need_ffmpeg=0
 for tool in ffmpeg ffprobe; do
   if [[ ! -x "$DEST/tools/$tool" ]]; then
     need_ffmpeg=1
   fi
 done
+if [[ "$need_ffmpeg" -eq 0 ]]; then
+  if ! "$DEST/tools/ffmpeg" -version 2>/dev/null | head -n 1 | grep -F "ffmpeg version $ffmpeg_release" >/dev/null; then
+    echo "Replacing FFmpeg with $ffmpeg_release..."
+    need_ffmpeg=1
+  fi
+fi
 if [[ "$need_ffmpeg" -eq 1 ]]; then
   case "$(uname -m)" in
     x86_64) archive="ffmpeg-release-amd64-static.tar.xz" ;;
@@ -195,7 +202,12 @@ else
   flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
   if ! flatpak info --user fr.handbrake.ghb >/dev/null 2>&1; then
     echo "Installing HandBrake from Flathub. This download is large."
-    flatpak install --user -y flathub fr.handbrake.ghb
+    flatpak install --user -y --noninteractive flathub fr.handbrake.ghb
+  else
+    echo "Updating HandBrake from Flathub..."
+    if ! flatpak update --user -y --noninteractive fr.handbrake.ghb; then
+      echo "HandBrake could not be updated. The installed copy will be used."
+    fi
   fi
   cat > "$DEST/tools/HandBrakeCLI" << 'EOF'
 #!/bin/sh

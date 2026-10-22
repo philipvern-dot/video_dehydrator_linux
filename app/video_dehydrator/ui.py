@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 import os
 import subprocess
 import tarfile
@@ -29,11 +30,12 @@ from .compare import CompareDialog
 from .engine import (
     BUDGET_ANCHORS, BUDGET_FACTORS, anchor_budget, app_version, bloat_decision,
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
+    linux_release_is_update,
     encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
-    format_budget_gib, format_byte_size, format_clock, format_force_report,
+    format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     is_encode_progress_line, is_video_file, larger_file_note,
-    live_encode_rate, mean_sample, merge_skip_row, missing_tools, nearest_budget_anchor,
+    encode_rate, live_encode_rate, mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor,
     over_band_id, over_ratio, pixel_seconds, probe_file, remaining_estimate,
     remembered_skip, remove_kept_original, remove_skip_row, replace_plan,
     replace_with_encode, run_lines, set_budget_picks, size_skip_reason,
@@ -69,7 +71,7 @@ OVER_COLORS = {
 }
 ISSUE_URL = 'https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml'
 KOFI = 'https://ko-fi.com/philipvern'
-RELEASES = 'https://api.github.com/repos/philipvern-dot/video-dehydrator/releases/latest'
+RELEASES = 'https://api.github.com/repos/philipvern-dot/video_dehydrator_linux/releases/latest'
 
 
 def os_label() -> str:
@@ -253,7 +255,13 @@ class ConvertWorker(QThread):
         self.file_index = 0
         self.rates8 = []
         self.rates10 = []
+        self.live8 = []
+        self.live10 = []
         self.ratios = []
+        self.file_samples = []
+        self.batch_samples = []
+        self.shown_at = None
+        self.shown_key = ''
         self._reset_clock()
 
     def _reset_clock(self):
@@ -265,6 +273,12 @@ class ConvertWorker(QThread):
         self.remembered = False
         self.ten_bit = False
         self.pixels = 0.0
+        self.live8 = []
+        self.live10 = []
+        self.file_samples = []
+        self.batch_samples = []
+        self.shown_at = None
+        self.shown_key = ''
 
     def _add_sample(self, bucket, value):
         try:
@@ -299,18 +313,25 @@ class ConvertWorker(QThread):
         elif task > self.task:
             self.pass_started = time.monotonic()
         if task > self.task:
+            self.live8 = []
+            self.live10 = []
             self.task = task
         self.progress_info = info
 
     def _chosen_rate(self, ten):
         finished = self.rates10 if ten else self.rates8
         live = 0.0
+        part = 0.0
         info = self.progress_info
         on_last = info and int(info.get('task') or 0) >= int(info.get('tasks') or 0) and self.task >= 2
         if on_last and ten == self.ten_bit and not self.checking:
             part = float(info.get('part') or 0) / 100.0
             live = live_encode_rate(self.pass1_sec, time.monotonic() - self.pass_started, part, self.pixels)
-        return live if live > 0 else mean_sample(finished)
+            if live > 0:
+                bucket = self.live10 if ten else self.live8
+                self._add_sample(bucket, live)
+                live = median_sample(bucket)
+        return encode_rate(live, finished, part)
 
     def _waiting(self):
         if self.stop_after.is_set():
@@ -325,6 +346,22 @@ class ConvertWorker(QThread):
             })
         return waiting
 
+    def _publish_key(self, phase, estimate):
+        task = int((self.progress_info or {}).get('task') or 0)
+        stop = 'stop' if self.stop_after.is_set() else 'run'
+        batch = 'ready' if estimate.get('have_batch') else 'wait'
+        return f"{phase}|{estimate.get('file_kind')}|{batch}|{stop}|{task}"
+
+    def _window_add(self, bucket, value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return
+        if number <= 0 or math.isnan(number) or math.isinf(number):
+            return
+        bucket.append(number)
+        del bucket[:-160]
+
     def _emit_eta(self):
         phase = 'check' if self.checking else 'encode'
         estimate = remaining_estimate(
@@ -337,7 +374,36 @@ class ConvertWorker(QThread):
             waiting=self._waiting(),
             phase=phase,
         )
-        self.eta.emit(estimate['text'])
+        key = self._publish_key(phase, estimate)
+        key_changed = key != self.shown_key
+        if key_changed:
+            self.file_samples = []
+            self.batch_samples = []
+        if float(estimate.get('file_seconds') or 0) > 0:
+            self._window_add(self.file_samples, estimate['file_seconds'])
+        if estimate.get('have_batch') and float(estimate.get('batch_seconds') or 0) > 0:
+            self._window_add(self.batch_samples, estimate['batch_seconds'])
+        file_seconds = median_sample(self.file_samples) or float(estimate.get('file_seconds') or 0)
+        batch_seconds = float(estimate.get('batch_seconds') or 0)
+        if estimate.get('have_batch'):
+            median_batch = median_sample(self.batch_samples)
+            if median_batch > 0:
+                batch_seconds = median_batch
+        text = format_eta_text(
+            self.progress_info, estimate.get('file_kind'), file_seconds, batch_seconds, bool(estimate.get('have_batch')),
+        )
+        since = 999.0 if self.shown_at is None else time.monotonic() - self.shown_at
+        if key_changed or since >= 30:
+            self.eta.emit(text)
+            self.shown_at = time.monotonic()
+            self.shown_key = key
+            if not key_changed:
+                self.file_samples = []
+                self.batch_samples = []
+                if file_seconds > 0:
+                    self._window_add(self.file_samples, file_seconds)
+                if estimate.get('have_batch') and batch_seconds > 0:
+                    self._window_add(self.batch_samples, batch_seconds)
 
     def run(self):
         stopped = False
@@ -1790,14 +1856,13 @@ class MainWindow(QMainWindow):
             self.log('Could not check for updates. ' + payload['error'], 'err')
             return
         tag = str(payload.get('tag') or '')
-        newer = compare_versions(tag, app_version())
-        if newer is None or newer <= 0:
+        asset = payload.get('asset')
+        if not linux_release_is_update(tag, app_version(), asset):
             self.update_offer = None
-            self.status.setText('This is the newest published version.')
+            self.status.setText('This is the newest published Linux version.')
             self.update_button.setEnabled(False)
             return
         remote = tag[1:] if tag[:1].lower() == 'v' else tag
-        asset = payload.get('asset')
         self.update_offer = {'tag': remote, 'asset': asset}
         self.status.setText(f'Version {remote} is available.')
         self.update_button.setEnabled(bool(asset and asset.get('url')))
@@ -1828,7 +1893,7 @@ class MainWindow(QMainWindow):
         lowered = name.lower()
         if 'linux' not in lowered or not lowered.endswith(('.tar.gz', '.tar.xz', '.run')):
             return
-        prefix = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/'
+        prefix = 'https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/'
         if not url.startswith(prefix):
             return
         if size > 500 * 1024 * 1024:
