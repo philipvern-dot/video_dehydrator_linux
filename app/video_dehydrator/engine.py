@@ -894,11 +894,12 @@ def encoder_name(probe: Probe) -> str:
     return 'x265'
 
 
-def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, encoder: str, reencode_audio: bool, thread_pool: int = 0) -> list:
+def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, encoder: str, reencode_audio: bool, thread_pool: int = 0, single_pass: bool = False) -> list:
     fallback = 'av_aac' if reencode_audio else 'none'
+    passes = ['--no-multi-pass', '--no-turbo'] if single_pass else ['--multi-pass', '--turbo']
     arguments = [
         '-i', source, '-o', temp, '--format', 'av_mkv', '--encoder', encoder,
-        '--encoder-preset', 'medium', '--vb', str(video_kbps), '--multi-pass', '--turbo',
+        '--encoder-preset', 'medium', '--vb', str(video_kbps), *passes,
         '--vfr', '--crop-mode', 'none', '--crop', '0:0:0:0', '--markers',
         '--all-audio', '--aencoder', 'copy', '--audio-copy-mask', AUDIO_COPY_MASK,
         '--audio-fallback', fallback,
@@ -924,7 +925,103 @@ def job_count(value) -> int:
         number = int(value)
     except (TypeError, ValueError):
         return 1
-    return 2 if number >= 2 else 1
+    if number < 1:
+        return 1
+    if number > 6:
+        return 6
+    return number
+
+
+def scan_limit_reached(found, limit) -> bool:
+    try:
+        cap = int(limit)
+        count = int(found)
+    except (TypeError, ValueError):
+        return False
+    if cap <= 0:
+        return False
+    return count >= cap
+
+
+def pass_two_did_not_start(text: str) -> bool:
+    body = text or ''
+    if 'encoded 0 frames' in body and 'task 2 of 2' in body:
+        return True
+    for needle in ('x265_encoder_open failed', 'Failure to initialise thread', "can't open stats file"):
+        if needle in body:
+            return True
+    return False
+
+
+def output_path_missing(text: str) -> bool:
+    body = text or ''
+    return 'avio_open2 failed' in body and 'errno -2' in body
+
+
+def hold_busy_path(plan) -> str:
+    if not plan or not plan.get('hold_dir'):
+        return ''
+    leaf = os.path.basename(plan.get('temp') or plan.get('source') or '')
+    if leaf.endswith('.vd.tmp.mkv'):
+        leaf = leaf[:-len('.vd.tmp.mkv')]
+    else:
+        leaf = os.path.splitext(leaf)[0]
+    if not leaf:
+        return ''
+    return os.path.join(plan['hold_dir'], leaf + '.vd.busy')
+
+
+def add_hold_busy_marker(plan) -> str:
+    path = hold_busy_path(plan)
+    if not path:
+        return ''
+    os.makedirs(plan['hold_dir'], exist_ok=True)
+    if plan.get('source'):
+        add_plexignore(os.path.dirname(plan['source']))
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(str(os.getpid()) + '\n')
+    return path
+
+
+def remove_hold_busy_marker(plan) -> None:
+    path = hold_busy_path(plan)
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def remove_stale_busy_markers(directory: str) -> None:
+    if not directory or not os.path.isdir(directory):
+        return
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith('.vd.busy'):
+            continue
+        path = os.path.join(directory, name)
+        pid = 0
+        try:
+            text = open(path, encoding='utf-8').read().strip()
+            if text.isdigit():
+                pid = int(text)
+        except OSError:
+            pid = 0
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if not alive:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def delete_targets(rows, selected=None) -> list:
@@ -1479,6 +1576,7 @@ def remove_kept_original(kept_path: str, new_path: str = '', book=None) -> bool:
 def remove_empty_directory(directory: str, book=None) -> None:
     if not directory or not os.path.isdir(directory):
         return
+    remove_stale_busy_markers(directory)
     try:
         if os.listdir(directory):
             return

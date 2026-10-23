@@ -32,15 +32,15 @@ from .engine import (
     BUDGET_ANCHORS, BUDGET_FACTORS, anchor_budget, app_version, bloat_decision,
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
     linux_release_is_update,
-    encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
+    add_hold_busy_marker, encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     is_encode_progress_line, is_video_file, larger_file_note,
     batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
-    over_band_id, over_ratio, pixel_seconds, probe_file, remaining_estimate,
-    remembered_skip, remove_kept_original, remove_skip_row, replace_plan,
-    replace_with_encode, run_lines, set_budget_picks, size_skip_reason,
+    output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
+    remembered_skip, remove_empty_directory, remove_hold_busy_marker, remove_kept_original, remove_skip_row, replace_plan,
+    replace_with_encode, run_lines, scan_limit_reached, set_budget_picks, size_skip_reason,
     space_saved_bytes, target_kbps, test_encoded_file, undo_replaced_file,
 )
 from .recycle import RecycleBook, set_purge_enabled
@@ -115,13 +115,14 @@ class ScanWorker(QThread):
     progress = Signal(int, int, str)
     finished_scan = Signal(object)
 
-    def __init__(self, root, recurse, ffprobe, skips, cancel):
+    def __init__(self, root, recurse, ffprobe, skips, cancel, limit=0):
         super().__init__()
         self.root = root
         self.recurse = recurse
         self.ffprobe = ffprobe
         self.skips = skips
         self.cancel = cancel
+        self.limit = int(limit or 0)
 
     def run(self):
         stats = {'seen': 0, 'hits': 0, 'errors': 0, 'ignored': 0, 'cancelled': False}
@@ -172,6 +173,12 @@ class ScanWorker(QThread):
                 if status == 'Can shrink':
                     stats['shrink'] = stats.get('shrink', 0) + 1
                 self.hit.emit(row_from_probe(entry.path, probe, decision, status))
+                if scan_limit_reached(stats['hits'], self.limit):
+                    stats['limited'] = True
+                    stack = []
+                    break
+            if stats.get('limited'):
+                break
         self.finished_scan.emit(stats)
 
 
@@ -412,17 +419,23 @@ class ConvertWorker(QThread):
         batch = 'ready' if estimate.get('have_batch') else 'wait'
         return f"{phase}|{estimate.get('file_kind')}|{batch}|{stop}|{task}|{slot.name}"
 
-    def _set_progress(self, value):
+    def _set_progress(self, value, force=False):
         slot = self._slot()
         slot.percent = float(value)
+        now = time.monotonic()
+        last = getattr(slot, 'paint_at', None)
+        if not force and last is not None and (now - last) < 0.5:
+            return False
+        slot.paint_at = now
         if self.jobs <= 1:
             self.progress.emit(value)
-            return
+            return True
         with self._state:
             self._running_percents[id(slot)] = slot.percent
             total = max(1, len(self.rows))
             overall = (self._finished * 100.0 + sum(self._running_percents.values())) / total
         self.progress.emit(overall)
+        return True
 
     def _window_add(self, bucket, value):
         try:
@@ -529,7 +542,11 @@ class ConvertWorker(QThread):
         self._resume.set()
 
     def run(self):
-        lanes = 2 if self.jobs >= 2 and len(self.rows) > 1 else 1
+        lanes = job_count(self.jobs)
+        if len(self.rows) <= 1:
+            lanes = 1
+        elif lanes > len(self.rows):
+            lanes = len(self.rows)
         self.jobs = lanes
         with self._state:
             self._queue = list(self.rows)
@@ -538,8 +555,8 @@ class ConvertWorker(QThread):
             self._stopped = False
             self._running_percents = {}
             self._file_eta = {}
-        if lanes == 2:
-            self.activity.emit('Encoding 2 files at a time.', 'text')
+        if lanes > 1:
+            self.activity.emit(f'Parallel jobs is {lanes}. Up to {lanes} files encode at the same time.', 'text')
 
         def work(node):
             self._tls.slot = EncodeSlot()
@@ -631,41 +648,84 @@ class ConvertWorker(QThread):
         encoder = encoder_name(probe)
         kbps = target_kbps(probe.width, probe.height)
         pool = 8 if self.jobs >= 2 else 0
-        args = handbrake_arguments(source, plan['temp'], probe, kbps, encoder, self.reencode, pool)
-        command = encode_command(
-            str(self.tools['handbrake']), args, self.jobs, int(getattr(self._tls, 'node', 0) or 0),
-            numa_node_count(), shutil.which('numactl') is not None,
-        )
-        log_lines = []
+        output_retries = 0
+        single_pass = False
+        handbrake_log = ''
+        while True:
+            add_hold_busy_marker(plan)
+            args = handbrake_arguments(source, plan['temp'], probe, kbps, encoder, self.reencode, pool, single_pass)
+            command = encode_command(
+                str(self.tools['handbrake']), args, self.jobs, int(getattr(self._tls, 'node', 0) or 0),
+                numa_node_count(), shutil.which('numactl') is not None,
+            )
+            log_lines = []
 
-        def on_line(line):
-            log_lines.append(line)
-            info = handbrake_progress(line)
-            if info is not None:
-                self._note_pass(info)
-                self._set_progress(info['overall'])
-                self._emit_eta()
-            elif self.detailed and line and not is_encode_progress_line(line):
-                self.activity.emit(line, 'dim')
+            def on_line(line):
+                log_lines.append(line)
+                if len(log_lines) > 500:
+                    del log_lines[:-500]
+                info = handbrake_progress(line)
+                if info is not None:
+                    task = int(info.get('task') or 0)
+                    changed = task != int(getattr(self._slot(), 'paint_task', 0) or 0)
+                    self._slot().paint_task = task
+                    self._note_pass(info)
+                    if self._set_progress(info['overall'], force=changed):
+                        self._emit_eta()
+                elif self.detailed and line and not is_encode_progress_line(line):
+                    prefix = f'{os.path.basename(source)}  ' if self.jobs > 1 else ''
+                    self.activity.emit(prefix + line, 'dim')
 
-        code, _joined = run_lines(command, on_line, self.cancel)
-        handbrake_log = '\n'.join(log_lines)
+            code, _joined = run_lines(command, on_line, self.cancel)
+            handbrake_log = '\n'.join(log_lines)
+            if self.cancel.is_set():
+                break
+            missing_file = code != 0 or not os.path.isfile(plan['temp'])
+            if missing_file and output_path_missing(handbrake_log) and output_retries < 2:
+                output_retries += 1
+                if os.path.isfile(plan['temp']):
+                    os.remove(plan['temp'])
+                self.activity.emit(f'The output folder was missing for {os.path.basename(source)}. Trying the two-pass encode again.', 'text')
+                continue
+            if missing_file and not single_pass and not output_path_missing(handbrake_log) and pass_two_did_not_start(handbrake_log):
+                single_pass = True
+                if os.path.isfile(plan['temp']):
+                    os.remove(plan['temp'])
+                self.activity.emit(f'The two-pass encode did not start for {os.path.basename(source)}. Trying one pass.', 'text')
+                continue
+            break
         if self.cancel.is_set():
+            remove_hold_busy_marker(plan)
             if os.path.isfile(plan['temp']):
                 os.remove(plan['temp'])
+            remove_empty_directory(plan['hold_dir'], self.book)
             self._restore_status(row, previous)
             self.activity.emit(f"Stopped {os.path.basename(source)}. The original stayed.", 'text')
+            self.file_update.emit(row)
+            return
+        if code != 0 or not os.path.isfile(plan['temp']):
+            remove_hold_busy_marker(plan)
+            if os.path.isfile(plan['temp']):
+                os.remove(plan['temp'])
+            remove_empty_directory(plan['hold_dir'], self.book)
+            row['status'] = 'Failed'
+            row['checked'] = True
+            row['reason'] = f'HandBrake stopped ({code}).'
+            append_convert_log('FAIL', row['reason'], source, '', '', probe.size_bytes, 0, 0, 0, probe.width, probe.height, kbps)
+            self.activity.emit(f"Failed {os.path.basename(source)}. {row['reason']}", 'err')
             self.file_update.emit(row)
             return
         self._remember_finished()
         self._slot().checking = True
         self._emit_eta()
+        remove_hold_busy_marker(plan)
         checked = test_encoded_file(
             str(self.tools['ffmpeg']), str(self.tools['ffprobe']), plan['temp'], probe, handbrake_log, self.reencode,
         )
         if not checked['ok']:
             if os.path.isfile(plan['temp']):
                 os.remove(plan['temp'])
+            remove_empty_directory(plan['hold_dir'], self.book)
             if size_skip_reason(checked['reason']):
                 note = larger_file_note(
                     checked['reason'], probe.size_bytes, checked['new_bytes'], kbps,
@@ -1075,17 +1135,47 @@ class MainWindow(QMainWindow):
         batch.addWidget(self.stop_after_button)
         batch.addWidget(self.continue_button)
         batch.addWidget(self.force_button)
+        batch.addStretch(1)
         self.jobs_box = QComboBox()
-        self.jobs_box.addItem('1', 1)
-        self.jobs_box.addItem('2', 2)
+        for count in range(1, 7):
+            self.jobs_box.addItem(str(count), count)
         saved_jobs = job_count(self.settings.get('jobs') or 1)
         jobs_index = self.jobs_box.findData(saved_jobs)
         self.jobs_box.setCurrentIndex(jobs_index if jobs_index >= 0 else 0)
         self.jobs_box.currentIndexChanged.connect(self.persist)
-        self.jobs_box.setToolTip('Encode one file, or two files at the same time. Two jobs keep each encode on one processor.')
-        batch.addWidget(QLabel('Jobs at once'))
+        jobs_tip = (
+            'How many files encode at the same time. Each file uses about 8 cores.\n\n'
+            '1 is right for most computers.\n'
+            '2 needs about 16 cores, in two groups of 8.\n'
+            '3 needs about 24 cores.\n'
+            '4 needs about 32 cores.\n'
+            '5 needs about 40 cores.\n'
+            '6 needs about 48 cores.\n\n'
+            'On fewer cores the files share the processor and the batch does not finish sooner. '
+            'On a laptop, leave this at 1 unless it is plugged in.'
+        )
+        jobs_label = QLabel('Parallel jobs')
+        jobs_label.setToolTip(jobs_tip)
+        self.jobs_box.setToolTip(jobs_tip)
+        self.find_box = QComboBox()
+        self.find_box.addItem('All', 0)
+        for count in (5, 10, 25, 50, 100):
+            self.find_box.addItem(str(count), count)
+        try:
+            saved_find = int(self.settings.get('findLimit') or 0)
+        except (TypeError, ValueError):
+            saved_find = 0
+        find_index = self.find_box.findData(saved_find)
+        self.find_box.setCurrentIndex(find_index if find_index >= 0 else 0)
+        self.find_box.currentIndexChanged.connect(self.persist)
+        find_tip = 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
+        find_label = QLabel('Find')
+        find_label.setToolTip(find_tip)
+        self.find_box.setToolTip(find_tip)
+        batch.addWidget(jobs_label)
         batch.addWidget(self.jobs_box)
-        batch.addStretch(1)
+        batch.addWidget(find_label)
+        batch.addWidget(self.find_box)
         batch_wrap = QWidget()
         batch_wrap.setLayout(batch)
 
@@ -1148,6 +1238,7 @@ class MainWindow(QMainWindow):
             'budgets': budget_pick_pack(),
             'purgeRecycle': self.recycle.isChecked(),
             'jobs': job_count(self.jobs_box.currentData()),
+            'findLimit': int(self.find_box.currentData() or 0),
             'listExtra': int(self.settings.get('listExtra') or 0),
             'columnOrder': self._column_names(),
         })
@@ -1454,7 +1545,7 @@ class MainWindow(QMainWindow):
         self.work = 'scan'
         self.awake.start()
         self.status.setText('Listing videos...')
-        self.worker = ScanWorker(root, self.subfolders.isChecked(), str(self.tools['ffprobe']), self.skips, self.cancel)
+        self.worker = ScanWorker(root, self.subfolders.isChecked(), str(self.tools['ffprobe']), self.skips, self.cancel, int(self.find_box.currentData() or 0))
         self.worker.hit.connect(self.add_hit)
         self.worker.progress.connect(self.on_scan_progress)
         self.worker.finished_scan.connect(self.scan_finished)
@@ -1482,6 +1573,10 @@ class MainWindow(QMainWindow):
                 self.log(f'{shrink} of those are under the line, and the picture can still shrink.', 'text')
             if stats.get('ignored'):
                 self.log(f"{stats['ignored']} files stayed off the list because a smaller copy was not smaller last time.", 'text')
+            if stats.get('limited'):
+                found = int(stats.get('hits') or 0)
+                word = 'file' if found == 1 else 'files'
+                self.log(f'Stopped scanning after {found} {word} that can be reduced.', 'text')
         self._refresh()
 
     def auto_ask(self) -> bool:
@@ -2475,6 +2570,7 @@ class MainWindow(QMainWindow):
         checked_ready = any(row['checked'] and row['status'] == 'Ready to delete' and row.get('kept') for row in self.rows)
         self.delete_button.setEnabled((not busy) and (checked_ready or selected_ready))
         self.jobs_box.setEnabled(not busy)
+        self.find_box.setEnabled(not busy)
         self.compare_button.setEnabled(not busy)
         self.undo_button.setEnabled((not busy) and any(os.path.isfile(str(item.get('kept') or '')) for item in self.pending))
         self.shutdown.setEnabled(not busy)
