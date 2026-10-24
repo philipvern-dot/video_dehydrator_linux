@@ -104,6 +104,12 @@ def test_rules():
     check(not harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11 >= 10'), 'a backwards timestamp fails')
     ac3_tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
     check(trailing_ac3_note(ac3_tail), 'one trailing incomplete AC3 frame is the allowed note')
+    same_stamp = '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10 | [null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 18 >= 18'
+    ac3_prefix = 'decode Last exit=-1094995529 '
+    mixed_tail = ac3_prefix + same_stamp + ' | ' + ac3_tail[len(ac3_prefix):]
+    check(trailing_ac3_note(mixed_tail), 'equal timestamps plus one short AC3 frame are allowed')
+    check(not harmless_decode_note(mixed_tail), 'the mixed note is not timestamps alone')
+    check(not trailing_ac3_note(mixed_tail.replace('10 >= 10', '10 >= 4', 1)), 'a backwards timestamp stays a failure beside the AC3 tail')
     check(not trailing_ac3_note(ac3_tail + ' | [mpeg4 @ 00000001] error while decoding'), 'a picture error stays a failure')
     check(not trailing_ac3_note(ac3_tail.replace('decode Last', 'decode First')), 'the first window does not use the tail exception')
     frame = bytearray(768)
@@ -127,7 +133,7 @@ def test_rules():
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
-    check(app_version() == '1.0.9.2', 'app version')
+    check(app_version() == '1.0.9.3', 'app version')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')
