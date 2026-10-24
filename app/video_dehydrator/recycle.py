@@ -420,6 +420,21 @@ def validate_file_plan(plan) -> dict:
     return None
 
 
+# A share can move a deleted file into #recycle after the delete returns.
+# Tests replace this with a short list. The times are seconds.
+lookup_waits = (1.0, 2.0, 4.0, 8.0)
+
+
+def path_arrives(path) -> bool:
+    waits = tuple(lookup_waits)
+    for attempt in range(len(waits) + 1):
+        if attempt:
+            time.sleep(waits[attempt - 1])
+        if os.path.lexists(path):
+            return True
+    return False
+
+
 def purge_file(plan, length: int):
     refused = validate_file_plan(plan)
     if refused:
@@ -436,7 +451,7 @@ def purge_file(plan, length: int):
         return result('failed', source, recycle_file, 'The #recycle path is not the recycle folder. Nothing was deleted.', name)
     if relative_under(plan, root) not in ('', None) and relative_under(plan, root) != '':
         return result('failed', source, recycle_file, 'The #recycle folder resolved to a different path. Nothing was deleted.', name)
-    if not os.path.lexists(recycle_file):
+    if not path_arrives(recycle_file):
         return result('missing', source, recycle_file, f'The drive recycle bin has no copy of {name} at {recycle_file}.', name)
     mismatch = _file_matches(plan, length)
     if mismatch:
@@ -482,7 +497,7 @@ def purge_plexignore(plan, length: int):
         return result('absent', source, recycle_file, 'No #recycle folder was found.', name)
     if is_symlink(plan['recycle_root']) or not os.path.isdir(plan['recycle_root']):
         return result('failed', source, recycle_file, 'The #recycle path is not the recycle folder. Nothing was deleted.', name)
-    if not os.path.lexists(recycle_file):
+    if not path_arrives(recycle_file):
         return result('missing', source, recycle_file, 'The recycled .plexignore was not found.', name)
     if is_symlink(recycle_file) or os.path.isdir(recycle_file) or os.path.basename(recycle_file).casefold() != '.plexignore':
         return result('mismatch', source, recycle_file, f'The item at {recycle_file} is not the holding-folder .plexignore. It was left in place.', name)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 from .engine import (
@@ -19,6 +20,7 @@ from .engine import (
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
+from . import recycle as recycle_mod
 from .recycle import (
     directory_is_empty, make_plan, purge_enabled, purge_file, purge_plexignore,
     remove_recycle_copy, remove_verified_empty, set_purge_enabled, stale_child,
@@ -133,7 +135,7 @@ def test_rules():
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
-    check(app_version() == '1.0.9.3', 'app version')
+    check(app_version() == '1.0.9.4', 'app version')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')
@@ -278,6 +280,30 @@ def test_recycle():
         check(not os.path.isdir(os.path.join(recycle_root, 'Solo')), 'the empty solo folder remained')
         check(os.path.isdir(recycle_root), 'the recycle root was removed with an empty chain')
         check(os.path.isfile(keep), 'an empty chain removed keep.txt')
+        recycle_mod.lookup_waits = (0.08, 0.08, 0.08, 0.08, 0.08)
+        late_rel = os.path.join('Late', 'Show', '.vd-originals', 'Late.avi')
+        late_hold = os.path.join(recycle_root, 'Late', 'Show', '.vd-originals')
+        os.makedirs(late_hold)
+        late_target = os.path.join(late_hold, 'Late.avi')
+        late_payload = b'late-bytes'
+
+        def write_late():
+            time.sleep(0.12)
+            with open(late_target, 'wb') as handle:
+                handle.write(late_payload)
+
+        thread = threading.Thread(target=write_late)
+        thread.start()
+        late = purge_file(_plan(root, late_rel, 'Late.avi'), len(late_payload))
+        thread.join()
+        check(late['status'] == 'purged', 'a recycle copy that arrived late was left behind')
+        check(not os.path.exists(late_target), 'the late recycle copy remained')
+        recycle_mod.lookup_waits = (0.001,)
+        never_rel = os.path.join('Never', 'Show', '.vd-originals', 'Never.avi')
+        os.makedirs(os.path.join(recycle_root, 'Never', 'Show', '.vd-originals'))
+        never = purge_file(_plan(root, never_rel, 'Never.avi'), 4)
+        check(never['status'] == 'missing', 'a copy that never arrived was removed')
+        recycle_mod.lookup_waits = (1.0, 2.0, 4.0, 8.0)
         busy = os.path.join(recycle_root, 'Busy')
         os.makedirs(busy)
         busy_file = os.path.join(busy, 'other.txt')
@@ -336,6 +362,7 @@ def test_recycle():
         check(os.path.isfile(extra), 'the other plexignore was removed')
         check(os.path.isdir(recycle_root), 'the recycle root was removed')
     finally:
+        recycle_mod.lookup_waits = (1.0, 2.0, 4.0, 8.0)
         shutil.rmtree(root, ignore_errors=True)
 
 
