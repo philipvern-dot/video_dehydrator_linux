@@ -36,7 +36,7 @@ from .engine import (
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     is_encode_progress_line, is_video_file, larger_file_note,
-    batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
+    batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
     output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
     remembered_skip, remove_empty_directory, remove_hold_busy_marker, remove_kept_original, remove_skip_row, replace_plan,
@@ -267,6 +267,7 @@ class ConvertWorker(QThread):
     file_update = Signal(object)
     finished_job = Signal(object)
     eta = Signal(str)
+    batch_count = Signal(int, int)
 
     def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1):
         super().__init__()
@@ -520,6 +521,8 @@ class ConvertWorker(QThread):
         while True:
             if self.cancel.is_set():
                 return None
+            taken = None
+            started = 0
             with self._state:
                 if self.stop_after.is_set():
                     self._stopped = True
@@ -527,9 +530,14 @@ class ConvertWorker(QThread):
                         return None
                 elif self._queue:
                     self._active += 1
-                    return self._queue.pop(0)
+                    self.file_index += 1
+                    started = self.file_index
+                    taken = self._queue.pop(0)
                 elif self._active == 0:
                     return None
+            if taken is not None:
+                self.batch_count.emit(started, len(self.rows))
+                return taken
             self._resume.wait(0.2)
             self._resume.clear()
 
@@ -549,6 +557,7 @@ class ConvertWorker(QThread):
             lanes = len(self.rows)
         self.jobs = lanes
         with self._state:
+            self.file_index = 0
             self._queue = list(self.rows)
             self._active = 0
             self._finished = 0
@@ -1203,6 +1212,12 @@ class MainWindow(QMainWindow):
         self.eta.setVisible(False)
         self.eta.setWordWrap(True)
         root.addWidget(self.eta)
+        self.batch_count = QLabel('')
+        self.batch_count.setVisible(False)
+        count_font = self.batch_count.font()
+        count_font.setBold(True)
+        self.batch_count.setFont(count_font)
+        root.addWidget(self.batch_count)
         bottom = QHBoxLayout()
         self.status = QLabel('Ready')
         self.progress = QProgressBar()
@@ -1285,6 +1300,7 @@ class MainWindow(QMainWindow):
             self.split_handle: 'Drag to make the video list taller or shorter. Double-click to put it back.',
             self.activity: 'Saved space, skipped videos, and problems are listed here.',
             self.progress: 'How far the current file has been encoded. The two passes share the bar evenly.',
+            self.batch_count: 'How many files in this batch have started.',
             self.eta: 'This file is the encode in progress. Estimated time remaining is the rest of the batch.',
             self.status: 'What the program is doing right now.',
         }
@@ -1646,6 +1662,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(lambda value: self.progress.setValue(int(value)))
         self.worker.file_update.connect(self.on_file_update)
         self.worker.eta.connect(self.set_eta)
+        self.worker.batch_count.connect(self.set_batch_count)
         self.worker.finished_job.connect(self.convert_finished)
         self.worker.start()
         self.status.setText('Converting...')
@@ -1659,10 +1676,22 @@ class MainWindow(QMainWindow):
         if show:
             self.eta.setToolTip(text)
 
+    def set_batch_count(self, started, total):
+        text = batch_count_text(started, total)
+        if self.work != 'encode' or not text:
+            self.batch_count.setText('')
+            self.batch_count.setVisible(False)
+            return
+        shown = text.split('/')
+        self.batch_count.setText(text)
+        self.batch_count.setToolTip(f'{shown[0]} of {shown[1]} files in this batch have started.')
+        self.batch_count.setVisible(True)
+
     def convert_finished(self, payload):
         self.work = 'idle'
         self.awake.stop()
         self.set_eta('')
+        self.set_batch_count(0, 0)
         self.skips = payload['skips']
         write_skips(self.skips)
         self.saved_bytes = payload['saved']

@@ -9,7 +9,7 @@ import threading
 import time
 
 from .engine import (
-    Probe, app_version, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
+    Probe, app_version, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
     add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
     job_count, linux_release_is_update, output_path_missing, pass_two_did_not_start,
     remove_empty_directory, remove_hold_busy_marker, scan_limit_reached,
@@ -20,6 +20,7 @@ from .engine import (
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
+from .helptext import SECTIONS
 from . import recycle as recycle_mod
 from .recycle import (
     directory_is_empty, make_plan, purge_enabled, purge_file, purge_plexignore,
@@ -135,7 +136,13 @@ def test_rules():
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
-    check(app_version() == '1.0.9.4', 'app version')
+    check(app_version() == '1.0.9.5', 'app version')
+    check(batch_count_text(4, 100) == '4/100', 'batch count')
+    check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
+    check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')
+    check(batch_count_text(120, 100) == '100/100', 'batch count stays within the batch')
+    guide = '\n'.join(body for _title, body in SECTIONS)
+    check('4/100 means this batch has started file 4 of 100' in guide, 'guide batch count')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')

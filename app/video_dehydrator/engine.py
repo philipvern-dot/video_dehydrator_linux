@@ -920,6 +920,19 @@ def handbrake_arguments(source: str, temp: str, probe: Probe, video_kbps: int, e
     return arguments
 
 
+def batch_count_text(started, total) -> str:
+    try:
+        done = int(started)
+        size = int(total)
+    except (TypeError, ValueError):
+        return ''
+    if size < 1 or done < 1:
+        return ''
+    if done > size:
+        done = size
+    return f'{done}/{size}'
+
+
 def job_count(value) -> int:
     try:
         number = int(value)

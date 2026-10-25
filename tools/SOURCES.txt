@@ -2,7 +2,7 @@ HandBrakeCLI
   HandBrake, GPL-2.0. https://handbrake.fr/
   The installer uses the official Linux Flatpak fr.handbrake.ghb
   from Flathub. Running the installer again updates that Flatpak.
-  Checked 2026-10-22: Flathub lists HandBrake 1.11.2.
+  Checked 2026-10-25: the current HandBrake release is still 1.11.2.
   https://flathub.org/apps/fr.handbrake.ghb
   Source: https://github.com/HandBrake/HandBrake/archive/refs/tags/1.11.2.tar.gz
 
@@ -11,7 +11,7 @@ ffmpeg, ffprobe
   The installer downloads the johnvansickle static GPL build
   ffmpeg-release-amd64-static.tar.xz, or the arm64 archive, from
   https://johnvansickle.com/ffmpeg/releases/
-  Checked 2026-10-22: that release archive is FFmpeg 7.0.2.
+  Checked 2026-10-25: that release archive is still FFmpeg 7.0.2.
   Running the installer again replaces the tools when the installed
   ffmpeg -version line is not 7.0.2.
   The archive contains ffmpeg and ffprobe. It does not contain ffplay.
