@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
@@ -31,7 +31,7 @@ from .compare import CompareDialog
 from .engine import (
     BUDGET_ANCHORS, BUDGET_FACTORS, anchor_budget, app_version, bloat_decision,
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
-    linux_release_is_update,
+    LINUX_DOWNLOAD_PREFIX, LINUX_RELEASES, linux_release_asset, linux_release_is_update,
     add_hold_busy_marker, encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
@@ -53,6 +53,20 @@ COLUMNS = [
     'File', 'Dimensions', 'Length', 'Size', 'GiB/h', 'Budget', 'Ratio', 'Target',
     'New size', 'Status', 'Space Saved', '~Savings',
 ]
+COLUMN_WIDTHS = {
+    'File': 220,
+    'Dimensions': 100,
+    'Length': 72,
+    'Size': 96,
+    'GiB/h': 64,
+    'Budget': 72,
+    'Ratio': 64,
+    'Target': 84,
+    'New size': 88,
+    'Status': 120,
+    'Space Saved': 100,
+    '~Savings': 88,
+}
 CONVERTIBLE = ('Bloated', 'Can shrink', 'Failed', 'Skipped', 'Forced')
 FOLDER_STATUSES = ('Bloated', 'Can shrink', 'Failed')
 SHOW_FILTERS = (
@@ -73,7 +87,6 @@ OVER_COLORS = {
 }
 ISSUE_URL = 'https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml'
 KOFI = 'https://ko-fi.com/philipvern'
-RELEASES = 'https://api.github.com/repos/philipvern-dot/video_dehydrator_linux/releases/latest'
 
 
 def os_label() -> str:
@@ -871,64 +884,82 @@ class ForceWorker(QThread):
 def _check_mark_path() -> str:
     folder = Path(tempfile.gettempdir()) / 'video-dehydrator'
     folder.mkdir(exist_ok=True)
-    path = folder / 'check.png'
-    if not path.is_file():
-        pix = QPixmap(18, 18)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        pen = QPen(QColor('#ffffff'))
-        pen.setWidth(3)
-        pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen)
-        painter.drawLine(4, 10, 8, 14)
-        painter.drawLine(8, 14, 15, 4)
-        painter.end()
-        pix.save(str(path), 'PNG')
+    path = folder / 'check-v2.png'
+    pix = QPixmap(18, 18)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    pen = QPen(QColor('#ffffff'))
+    pen.setWidth(3)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.drawLine(4, 10, 8, 14)
+    painter.drawLine(8, 14, 15, 4)
+    painter.end()
+    pix.save(str(path), 'PNG')
     return str(path).replace('\\', '/')
 
 
-def control_style() -> str:
+def indicator_style() -> str:
     mark = _check_mark_path()
     return f'''
-    QPushButton {{
+    QCheckBox {{
+        spacing: 8px;
+    }}
+    QCheckBox::indicator, QTableWidget::indicator {{
+        width: 18px;
+        height: 18px;
+        border: 2px solid #111827;
+        border-radius: 3px;
+        background: #ffffff;
+        image: none;
+    }}
+    QCheckBox::indicator:hover, QTableWidget::indicator:hover {{
+        border: 2px solid #1d4ed8;
+        background: #dbeafe;
+    }}
+    QCheckBox::indicator:checked, QTableWidget::indicator:checked {{
+        background: #111827;
+        border: 2px solid #111827;
+        image: url("{mark}");
+    }}
+    QCheckBox::indicator:checked:hover, QTableWidget::indicator:checked:hover {{
+        background: #1e3a8a;
+        border: 2px solid #1e3a8a;
+        image: url("{mark}");
+    }}
+    QCheckBox::indicator:disabled, QTableWidget::indicator:disabled {{
+        background: #e5e7eb;
+        border: 2px solid #64748b;
+        image: none;
+    }}
+    '''
+
+
+def control_style() -> str:
+    return '''
+    QPushButton {
         background: #f8fafc;
         color: #111827;
         border: 1px solid #64748b;
         border-bottom: 3px solid #334155;
         border-radius: 6px;
         padding: 5px 12px;
-    }}
-    QPushButton:hover {{ background: #e2e8f0; }}
-    QPushButton:pressed {{
+    }
+    QPushButton:hover { background: #e2e8f0; }
+    QPushButton:pressed {
         background: #cbd5e1;
         border-bottom: 1px solid #334155;
         margin-top: 2px;
         padding-top: 7px;
         padding-bottom: 3px;
-    }}
-    QPushButton:disabled {{
+    }
+    QPushButton:disabled {
         color: #94a3b8;
         background: #e5e7eb;
         border: 1px solid #cbd5e1;
         border-bottom: 3px solid #cbd5e1;
-    }}
-    QTableWidget::indicator {{
-        width: 18px;
-        height: 18px;
-        border: 2px solid #111827;
-        border-radius: 4px;
-        background: #ffffff;
-    }}
-    QTableWidget::indicator:hover {{
-        border: 2px solid #1d4ed8;
-        background: #dbeafe;
-    }}
-    QTableWidget::indicator:checked {{
-        background: #1d4ed8;
-        border: 2px solid #1e3a8a;
-        image: url({mark});
-    }}
-    '''
+    }
+    ''' + indicator_style()
 
 
 class MainWindow(QMainWindow):
@@ -1044,8 +1075,14 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.ElideRight)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(48)
         header.setSectionsMovable(True)
         header.setFirstSectionMovable(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1054,7 +1091,13 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_selection)
         header.sectionClicked.connect(self.sort_column)
         header.sectionMoved.connect(self._column_moved)
+        header.sectionResized.connect(self._column_resized)
+        self._width_timer = QTimer(self)
+        self._width_timer.setSingleShot(True)
+        self._width_timer.setInterval(400)
+        self._width_timer.timeout.connect(self.persist)
         self._restore_columns()
+        self._restore_column_widths()
 
         options_page = QWidget()
         options_layout = QVBoxLayout(options_page)
@@ -1256,6 +1299,7 @@ class MainWindow(QMainWindow):
             'findLimit': int(self.find_box.currentData() or 0),
             'listExtra': int(self.settings.get('listExtra') or 0),
             'columnOrder': self._column_names(),
+            'columnWidths': self._column_widths(),
         })
         save_settings(self.settings)
 
@@ -1296,7 +1340,7 @@ class MainWindow(QMainWindow):
             self.clear_button: 'Remove scanned files from the list. Files in .vd-originals stay.',
             self.show_button: 'Check a group to show only those rows. Hidden rows stay unchecked.',
             self.select_shown: 'Check the visible rows Optimize can take.',
-            self.table: 'Checked rows are ready to shrink. Click a heading to sort, or drag it to move that column.',
+            self.table: 'Checked rows are ready to shrink. Drag a column edge to change its width. Drag a heading to move that column. The File column stays first.',
             self.split_handle: 'Drag to make the video list taller or shorter. Double-click to put it back.',
             self.activity: 'Saved space, skipped videos, and problems are listed here.',
             self.progress: 'How far the current file has been encoded. The two passes share the bar evenly.',
@@ -1336,6 +1380,30 @@ class MainWindow(QMainWindow):
             if current != visual:
                 header.moveSection(current, visual)
         header.blockSignals(False)
+
+    def _column_widths(self) -> dict:
+        header = self.table.horizontalHeader()
+        widths = {}
+        for logical, name in enumerate(COLUMNS):
+            widths[name] = int(header.sectionSize(logical))
+        return widths
+
+    def _restore_column_widths(self):
+        saved = self.settings.get('columnWidths') or {}
+        header = self.table.horizontalHeader()
+        header.blockSignals(True)
+        for logical, name in enumerate(COLUMNS):
+            width = COLUMN_WIDTHS[name]
+            custom = saved.get(name)
+            if isinstance(custom, int) and 48 <= custom <= 4000:
+                width = custom
+            header.resizeSection(logical, width)
+        header.blockSignals(False)
+
+    def _column_resized(self, _logical, _old, _new):
+        if self.loading:
+            return
+        self._width_timer.start()
 
     def _column_moved(self, _logical, _old, _new):
         self._skip_sort = True
@@ -2188,7 +2256,7 @@ class MainWindow(QMainWindow):
             found = Signal(object)
             def run(self_inner):
                 try:
-                    request = Request(RELEASES, headers={'User-Agent': 'VideoDehydrator', 'Accept': 'application/vnd.github+json'})
+                    request = Request(LINUX_RELEASES, headers={'User-Agent': 'VideoDehydrator', 'Accept': 'application/vnd.github+json'})
                     with urlopen(request, timeout=20) as response:
                         import json
                         payload = json.loads(response.read().decode('utf-8'))
@@ -2196,18 +2264,7 @@ class MainWindow(QMainWindow):
                     self_inner.found.emit({'error': str(exc)})
                     return
                 tag = str(payload.get('tag_name') or '')
-                assets = payload.get('assets') or []
-                linux_asset = None
-                for asset in assets:
-                    name = str(asset.get('name') or '')
-                    lowered = name.lower()
-                    if 'linux' in lowered and lowered.endswith(('.tar.gz', '.tar.xz', '.run')):
-                        linux_asset = {
-                            'name': name,
-                            'size': int(asset.get('size') or 0),
-                            'url': str(asset.get('browser_download_url') or ''),
-                        }
-                self_inner.found.emit({'tag': tag, 'asset': linux_asset})
+                self_inner.found.emit({'tag': tag, 'asset': linux_release_asset(payload)})
 
         self.update_worker = UpdateWorker()
         self.update_worker.found.connect(self.update_found)
@@ -2256,8 +2313,7 @@ class MainWindow(QMainWindow):
         lowered = name.lower()
         if 'linux' not in lowered or not lowered.endswith(('.tar.gz', '.tar.xz', '.run')):
             return
-        prefix = 'https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/'
-        if not url.startswith(prefix):
+        if not url.startswith(LINUX_DOWNLOAD_PREFIX):
             return
         if size > 500 * 1024 * 1024:
             QMessageBox.warning(self, 'Video Dehydrator', 'That published file is too large to install from here.')
@@ -2637,6 +2693,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
 def main():
     app = QApplication([])
     app.setStyle('Fusion')
+    app.setStyleSheet(indicator_style())
     window = MainWindow()
     window.show()
     QThread.currentThread()

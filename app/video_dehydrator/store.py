@@ -24,6 +24,7 @@ DEFAULTS = {
     'recycleAlertMuted': False,
     'listExtra': 0,
     'columnOrder': [],
+    'columnWidths': {},
 }
 
 
@@ -49,6 +50,7 @@ def load_settings() -> dict:
         settings['listExtra'] = 0
     order = settings.get('columnOrder')
     settings['columnOrder'] = [str(name) for name in order] if isinstance(order, list) else []
+    settings['columnWidths'] = clean_column_widths(settings.get('columnWidths'))
     settings['autoAsk'] = bool(settings.get('autoAsk', True))
     settings['purgeRecycle'] = bool(settings.get('purgeRecycle'))
     settings['recycleAlertMuted'] = bool(settings.get('recycleAlertMuted'))
@@ -60,6 +62,20 @@ def save_settings(settings: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {key: settings.get(key, DEFAULTS[key]) for key in DEFAULTS}
     path.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+
+
+def clean_column_widths(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for key, raw in value.items():
+        try:
+            width = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 48 <= width <= 4000:
+            clean[str(key)] = width
+    return clean
 
 
 def flatten_rows(value):

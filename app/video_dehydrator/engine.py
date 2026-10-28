@@ -1711,6 +1711,10 @@ def version_numbers(text: str):
     return numbers
 
 
+LINUX_RELEASES = 'https://api.github.com/repos/philipvern-dot/video_dehydrator_linux/releases/latest'
+LINUX_DOWNLOAD_PREFIX = 'https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/'
+
+
 def linux_release_is_update(tag: str, current: str, asset) -> bool:
     newer = compare_versions(tag, current)
     if newer is None or newer <= 0:
@@ -1720,6 +1724,40 @@ def linux_release_is_update(tag: str, current: str, asset) -> bool:
     name = str(asset.get('name') or '').lower()
     url = str(asset.get('url') or '')
     return 'linux' in name and name.endswith(('.tar.gz', '.tar.xz', '.run')) and bool(url)
+
+
+def linux_release_asset(payload):
+    """The Linux archive on a GitHub release, or None when that file is not there."""
+    if not isinstance(payload, dict):
+        return None
+    for asset in payload.get('assets') or []:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get('name') or '')
+        lowered = name.lower()
+        if 'linux' not in lowered or not lowered.endswith(('.tar.gz', '.tar.xz', '.run')):
+            continue
+        url = str(asset.get('browser_download_url') or '')
+        if not url.startswith(LINUX_DOWNLOAD_PREFIX):
+            continue
+        try:
+            size = int(asset.get('size') or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return {'name': name, 'size': size, 'url': url}
+    return None
+
+
+def linux_update_offer(payload, current: str):
+    """Return the tag and archive when payload is a newer Linux release this program can install."""
+    if not isinstance(payload, dict):
+        return None
+    tag = str(payload.get('tag_name') or '')
+    asset = linux_release_asset(payload)
+    if not linux_release_is_update(tag, current, asset):
+        return None
+    remote = tag[1:] if tag[:1].lower() == 'v' else tag
+    return {'tag': remote, 'asset': asset}
 
 
 def compare_versions(left: str, right: str):

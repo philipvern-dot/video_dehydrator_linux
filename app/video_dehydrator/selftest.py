@@ -11,7 +11,7 @@ import time
 from .engine import (
     Probe, app_version, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
     add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
-    job_count, linux_release_is_update, output_path_missing, pass_two_did_not_start,
+    job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
     remove_empty_directory, remove_hold_busy_marker, scan_limit_reached,
     ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
     encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
@@ -26,7 +26,7 @@ from .recycle import (
     directory_is_empty, make_plan, purge_enabled, purge_file, purge_plexignore,
     remove_recycle_copy, remove_verified_empty, set_purge_enabled, stale_child,
 )
-from .store import flatten_rows
+from .store import clean_column_widths, flatten_rows
 
 
 def check(condition, message):
@@ -136,13 +136,48 @@ def test_rules():
     check(compare_versions('1.0.5', '1.0.5.1') == -1, 'shorter version is older')
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
-    check(app_version() == '1.0.9.5', 'app version')
+    check(compare_versions('v1.0.9.6', '1.0.9.5') == 1, '1.0.9.6 is newer than 1.0.9.5')
+    release = {
+        'tag_name': 'v1.0.9.6',
+        'assets': [{
+            'name': 'video_dehydrator_linux.tar.gz',
+            'size': 80000,
+            'browser_download_url': 'https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/v1.0.9.6/video_dehydrator_linux.tar.gz',
+        }],
+    }
+    offer = linux_update_offer(release, '1.0.9.5')
+    check(offer and offer['tag'] == '1.0.9.6', 'check for updates offers 1.0.9.6')
+    check(offer['asset']['name'] == 'video_dehydrator_linux.tar.gz', 'the update file is the Linux archive')
+    check(offer['asset']['url'].startswith('https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/'), 'the update downloads from the Linux release')
+    check(linux_update_offer(release, '1.0.9.6') is None, 'the same version is not an update')
+    check(linux_update_offer(release, '1.0.9.7') is None, 'an older release is not an update')
+    windows_only = {
+        'tag_name': 'v1.0.9.6',
+        'assets': [{
+            'name': 'video_dehydrator.exe',
+            'size': 10,
+            'browser_download_url': 'https://github.com/philipvern-dot/video_dehydrator_linux/releases/download/v1.0.9.6/video_dehydrator.exe',
+        }],
+    }
+    check(linux_update_offer(windows_only, '1.0.9.5') is None, 'a Windows installer is not a Linux update')
+    elsewhere = {
+        'tag_name': 'v1.0.9.6',
+        'assets': [{
+            'name': 'video_dehydrator_linux.tar.gz',
+            'size': 10,
+            'browser_download_url': 'https://example.com/video_dehydrator_linux.tar.gz',
+        }],
+    }
+    check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
+    check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
+    check(app_version() == '1.0.9.6', 'app version')
     check(batch_count_text(4, 100) == '4/100', 'batch count')
     check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
     check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')
     check(batch_count_text(120, 100) == '100/100', 'batch count stays within the batch')
     guide = '\n'.join(body for _title, body in SECTIONS)
     check('4/100 means this batch has started file 4 of 100' in guide, 'guide batch count')
+    check('Drag a column edge to change its width' in guide, 'guide column width')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')
