@@ -6,7 +6,7 @@ open_install_terminal() {
   local script="$1"
   local quoted cmd
   quoted=$(printf '%q' "$script")
-  cmd="export VD_INSTALL_UI=1; bash $quoted; status=\$?; echo; if [[ \$status -eq 0 ]]; then echo 'Installed. Opening Video Dehydrator.'; else echo \"The installer stopped (\$status).\"; echo 'The log is ~/.local/state/video-dehydrator/install.log'; fi; echo; read -r -p 'Press Enter to close. '"
+  cmd="export VD_INSTALL_UI=1; bash $quoted; status=\$?; echo; if [[ \$status -eq 0 ]]; then echo 'Installed. Opening Video Dehydrator.'; exit 0; fi; echo \"The installer stopped (\$status).\"; echo 'The log is ~/.local/state/video-dehydrator/install.log'; echo; read -r -p 'Press Enter to close. '"
   if command -v ptyxis >/dev/null 2>&1 && ptyxis --new-window --title "Video Dehydrator update" -- bash -lc "$cmd"; then
     return 0
   fi

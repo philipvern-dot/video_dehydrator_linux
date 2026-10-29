@@ -170,7 +170,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.7', 'app version')
+    check(app_version() == '1.0.9.8', 'app version')
     check(batch_count_text(4, 100) == '4/100', 'batch count')
     check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
     check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')
