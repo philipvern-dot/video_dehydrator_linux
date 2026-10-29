@@ -2,6 +2,44 @@
 # Install Video Dehydrator into the home folder. Re-running keeps settings.
 set -euo pipefail
 
+open_install_terminal() {
+  local script="$1"
+  local quoted cmd
+  quoted=$(printf '%q' "$script")
+  cmd="export VD_INSTALL_UI=1; bash $quoted; status=\$?; echo; if [[ \$status -eq 0 ]]; then echo 'Installed. Opening Video Dehydrator.'; else echo \"The installer stopped (\$status).\"; echo 'The log is ~/.local/state/video-dehydrator/install.log'; fi; echo; read -r -p 'Press Enter to close. '"
+  if command -v ptyxis >/dev/null 2>&1 && ptyxis --new-window --title "Video Dehydrator update" -- bash -lc "$cmd"; then
+    return 0
+  fi
+  if command -v gnome-terminal >/dev/null 2>&1 && gnome-terminal --wait --title="Video Dehydrator update" -- bash -lc "$cmd"; then
+    return 0
+  fi
+  if command -v x-terminal-emulator >/dev/null 2>&1 && x-terminal-emulator -T "Video Dehydrator update" -e bash -lc "$cmd"; then
+    return 0
+  fi
+  if command -v kgx >/dev/null 2>&1 && kgx -- bash -lc "$cmd"; then
+    return 0
+  fi
+  return 1
+}
+
+# The Update button starts this script with no window, then the program closes.
+# Open a terminal before any message, so a closed pipe cannot stop the script.
+if [[ "${VD_INSTALL_UI:-}" != "1" && ! -t 1 ]]; then
+  LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/video-dehydrator"
+  mkdir -p "$LOG_DIR"
+  LOG="$LOG_DIR/install.log"
+  exec >>"$LOG" 2>&1
+  echo "---- $(date -Is 2>/dev/null || date) ----"
+  if open_install_terminal "$0"; then
+    exit 0
+  fi
+  echo "No terminal was opened. The installer is continuing in this log."
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Video Dehydrator" "The update is running. Details are in $LOG" || true
+  fi
+  export VD_INSTALL_UI=1
+fi
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEST="${VIDEO_DEHYDRATOR_HOME:-$HOME/.local/opt/video-dehydrator}"
 BIN_DIR="$HOME/.local/bin"
@@ -257,3 +295,7 @@ if [[ -n "$handbrake_note" ]]; then
 fi
 echo
 echo "Settings stay in $DEST/app and are kept when you run this installer again."
+if [[ "${VD_INSTALL_UI:-}" == "1" && -x "$BIN_DIR/video-dehydrator" ]]; then
+  nohup "$BIN_DIR/video-dehydrator" >/dev/null 2>&1 &
+  disown || true
+fi

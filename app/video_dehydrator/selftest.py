@@ -170,7 +170,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.6', 'app version')
+    check(app_version() == '1.0.9.7', 'app version')
     check(batch_count_text(4, 100) == '4/100', 'batch count')
     check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
     check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')
@@ -178,6 +178,7 @@ def test_rules():
     guide = '\n'.join(body for _title, body in SECTIONS)
     check('4/100 means this batch has started file 4 of 100' in guide, 'guide batch count')
     check('Drag a column edge to change its width' in guide, 'guide column width')
+    check('opens a terminal, and runs its installer' in guide, 'guide update terminal')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')

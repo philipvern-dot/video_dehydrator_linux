@@ -75,7 +75,7 @@ SECTIONS = [
     ),
     (
         'Updates',
-        "The program checks the Linux releases on GitHub when it opens. Check for updates looks again. Update downloads the Linux archive and runs its installer.\n\n"
+        "The program checks the Linux releases on GitHub when it opens. Check for updates looks again. Update downloads the Linux archive, opens a terminal, and runs its installer. The program opens again when that finishes.\n\n"
         "Report a bug opens a GitHub page. This program does not send the report. You submit it on the GitHub page. Include latest activity adds the latest lines from the activity box, which can include folder paths.\n\n"
         "Donate opens https://ko-fi.com/philipvern. The program stays free.",
     ),

@@ -1,3 +1,3 @@
 """Video Dehydrator for Linux."""
 
-__version__ = '1.0.9.6'
+__version__ = '1.0.9.7'

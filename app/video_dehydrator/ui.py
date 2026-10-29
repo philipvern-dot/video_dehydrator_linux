@@ -1330,7 +1330,7 @@ class MainWindow(QMainWindow):
             self.check_update: 'Look on GitHub for a newer version.',
             self.donate: 'Free forever. Tips of $5 or more can include a feature suggestion.',
             self.report: 'Open a GitHub bug report with this version filled in.',
-            self.update_button: 'Download the newer Linux archive and install it. This window closes while that runs.',
+            self.update_button: 'Download the newer Linux archive and install it. A terminal opens, and this window closes while that runs.',
             self.folder_pick: 'Folders with files to shrink. Pick one for a smaller job.',
             self.select_folder: 'Check the files in this folder and clear the other checks.',
             self.over_pick: 'Slight is under 1.5x, Heavy is under 3x, and Extreme is 3x or more.',
@@ -2376,7 +2376,17 @@ class MainWindow(QMainWindow):
         script = payload.get('script')
         if not script:
             return
-        subprocess.Popen(['bash', script], cwd=str(Path(script).parent), start_new_session=True)
+        log_dir = Path.home() / '.local' / 'state' / 'video-dehydrator'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_dir / 'install.log', 'ab', buffering=0)
+        subprocess.Popen(
+            ['bash', script],
+            cwd=str(Path(script).parent),
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
         QApplication.quit()
 
     def apply_folder(self):
