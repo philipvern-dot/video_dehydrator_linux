@@ -472,6 +472,33 @@ def remaining_estimate(progress, pass_elapsed_sec=0, pass1_sec=0, pass_ratio=0, 
     }
 
 
+def lane_pass_name(task, checking=False) -> str:
+    if checking:
+        return 'checking'
+    try:
+        number = int(task or 0)
+    except (TypeError, ValueError):
+        number = 0
+    if number >= 2:
+        return f'pass {number}'
+    if number >= 1:
+        return 'first pass'
+    return ''
+
+
+def lane_bar_text(name, percent, pass_name) -> str:
+    label = str(name or 'File')
+    try:
+        pct = int(round(float(percent or 0)))
+    except (TypeError, ValueError):
+        pct = 0
+    pct = max(0, min(100, pct))
+    text = f'{label}   {pct}%'
+    if pass_name:
+        text += f'   {pass_name}'
+    return text
+
+
 def format_eta_text(progress, file_kind, file_seconds, batch_seconds, have_batch) -> str:
     if file_kind == 'pass':
         pass_no = int(progress.get('task') or 1) if progress else 1

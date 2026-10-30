@@ -35,6 +35,7 @@ from .engine import (
     add_hold_busy_marker, encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
+    lane_bar_text, lane_pass_name,
     is_encode_progress_line, is_video_file, larger_file_note,
     batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
@@ -277,6 +278,7 @@ class EncodeSlot:
 class ConvertWorker(QThread):
     activity = Signal(str, str)
     progress = Signal(float)
+    lanes = Signal(object)
     file_update = Signal(object)
     finished_job = Signal(object)
     eta = Signal(str)
@@ -311,6 +313,8 @@ class ConvertWorker(QThread):
         self._stopped = False
         self._running_percents = {}
         self._file_eta = {}
+        self._live_slots = []
+        self._lanes_paint_at = None
         self._eta_shown_at = None
         self._eta_shown_key = ''
 
@@ -446,10 +450,34 @@ class ConvertWorker(QThread):
             return True
         with self._state:
             self._running_percents[id(slot)] = slot.percent
-            total = max(1, len(self.rows))
-            overall = (self._finished * 100.0 + sum(self._running_percents.values())) / total
-        self.progress.emit(overall)
+            if not force and self._lanes_paint_at is not None and (now - self._lanes_paint_at) < 0.5:
+                return False
+            self._lanes_paint_at = now
+        self._emit_lane_bars()
         return True
+
+    def _lane_snapshot(self):
+        with self._state:
+            slots = list(self._live_slots)
+        rows = []
+        for item in slots:
+            if not item.name:
+                continue
+            info = item.progress_info or {}
+            rows.append({
+                'name': item.name,
+                'percent': float(item.percent),
+                'pass_name': lane_pass_name(info.get('task'), item.checking),
+            })
+        return rows
+
+    def _emit_lane_bars(self):
+        rows = self._lane_snapshot()
+        if len(rows) > 1:
+            self.lanes.emit(rows)
+            return
+        self.lanes.emit([])
+        self.progress.emit(rows[0]['percent'] if rows else 0)
 
     def _window_add(self, bucket, value):
         try:
@@ -581,16 +609,28 @@ class ConvertWorker(QThread):
             self.activity.emit(f'Parallel jobs is {lanes}. Up to {lanes} files encode at the same time.', 'text')
 
         def work(node):
-            self._tls.slot = EncodeSlot()
+            slot = EncodeSlot()
+            self._tls.slot = slot
             self._tls.node = node
-            while True:
-                row = self._take_row()
-                if row is None:
-                    return
-                try:
-                    self.convert_row(row)
-                finally:
-                    self._finish_active()
+            with self._state:
+                self._live_slots.append(slot)
+            try:
+                while True:
+                    row = self._take_row()
+                    if row is None:
+                        return
+                    try:
+                        self.convert_row(row)
+                    finally:
+                        slot.name = ''
+                        slot.checking = False
+                        self._finish_active()
+                        self._set_progress(0, force=True)
+            finally:
+                with self._state:
+                    if slot in self._live_slots:
+                        self._live_slots.remove(slot)
+                self._set_progress(0, force=True)
 
         if lanes == 1:
             work(0)
@@ -739,6 +779,7 @@ class ConvertWorker(QThread):
             return
         self._remember_finished()
         self._slot().checking = True
+        self._set_progress(self._slot().percent, force=True)
         self._emit_eta()
         remove_hold_busy_marker(plan)
         checked = test_encoded_file(
@@ -931,6 +972,11 @@ def indicator_style() -> str:
         background: #e5e7eb;
         border: 2px solid #64748b;
         image: none;
+    }}
+    QCheckBox::indicator:checked:disabled, QTableWidget::indicator:checked:disabled {{
+        background: #334155;
+        border: 2px solid #334155;
+        image: url("{mark}");
     }}
     '''
 
@@ -1261,6 +1307,30 @@ class MainWindow(QMainWindow):
         count_font.setBold(True)
         self.batch_count.setFont(count_font)
         root.addWidget(self.batch_count)
+        self.job_bars = []
+        self.job_host = QWidget()
+        job_layout = QVBoxLayout(self.job_host)
+        job_layout.setContentsMargins(0, 4, 0, 4)
+        job_layout.setSpacing(6)
+        for _index in range(6):
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(2)
+            label = QLabel('')
+            label.setMinimumWidth(0)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(8)
+            row_layout.addWidget(label)
+            row_layout.addWidget(bar)
+            row.setVisible(False)
+            job_layout.addWidget(row)
+            self.job_bars.append((row, label, bar))
+        self.job_host.setVisible(False)
+        root.addWidget(self.job_host)
         bottom = QHBoxLayout()
         self.status = QLabel('Ready')
         self.progress = QProgressBar()
@@ -1344,6 +1414,7 @@ class MainWindow(QMainWindow):
             self.split_handle: 'Drag to make the video list taller or shorter. Double-click to put it back.',
             self.activity: 'Saved space, skipped videos, and problems are listed here.',
             self.progress: 'How far the current file has been encoded. The two passes share the bar evenly.',
+            self.job_host: 'Each file that is encoding has its own bar. The bars change about twice a second.',
             self.batch_count: 'How many files in this batch have started.',
             self.eta: 'This file is the encode in progress. Estimated time remaining is the rest of the batch.',
             self.status: 'What the program is doing right now.',
@@ -1727,14 +1798,47 @@ class MainWindow(QMainWindow):
             jobs=job_count(self.jobs_box.currentData()),
         )
         self.worker.activity.connect(self.log)
-        self.worker.progress.connect(lambda value: self.progress.setValue(int(value)))
+        self.worker.progress.connect(self._set_single_progress)
+        self.worker.lanes.connect(self.set_lanes)
         self.worker.file_update.connect(self.on_file_update)
         self.worker.eta.connect(self.set_eta)
         self.worker.batch_count.connect(self.set_batch_count)
         self.worker.finished_job.connect(self.convert_finished)
         self.worker.start()
+        self.set_lanes([])
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.status.setText('Converting...')
         self._refresh()
+
+    def _set_single_progress(self, value):
+        if self.job_host.isVisible():
+            return
+        self.progress.setVisible(True)
+        self.progress.setValue(max(0, min(100, int(value))))
+
+    def set_lanes(self, rows):
+        if self.work != 'encode':
+            rows = []
+        rows = list(rows or [])
+        multi = len(rows) > 1
+        self.job_host.setVisible(multi)
+        self.progress.setVisible(not multi)
+        width = max(160, self.job_host.width() or self.width() - 48)
+        for index, (row_widget, label, bar) in enumerate(self.job_bars):
+            if index >= len(rows):
+                row_widget.setVisible(False)
+                continue
+            item = rows[index]
+            text = lane_bar_text(item.get('name'), item.get('percent'), item.get('pass_name'))
+            shown = label.fontMetrics().elidedText(text, Qt.ElideMiddle, width)
+            if label.text() != shown:
+                label.setText(shown)
+            label.setToolTip(text)
+            percent = max(0, min(100, int(round(float(item.get('percent') or 0)))))
+            if bar.value() != percent:
+                bar.setValue(percent)
+            row_widget.setVisible(True)
 
     def set_eta(self, text):
         text = str(text or '')
@@ -1758,6 +1862,9 @@ class MainWindow(QMainWindow):
     def convert_finished(self, payload):
         self.work = 'idle'
         self.awake.stop()
+        self.set_lanes([])
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.set_eta('')
         self.set_batch_count(0, 0)
         self.skips = payload['skips']
