@@ -738,6 +738,24 @@ def shrinkable_picture(probe: Probe, target, estimate) -> bool:
     return probe.video_bitrate > (int(target) * 1000.0 * 1.05)
 
 
+def efficient_file_will_not_shrink(probe: Probe, target) -> bool:
+    """An HEVC or AV1 file with no stored picture rate will not shrink when the
+    whole file fits the target plus a modest audio track for each audio stream.
+    """
+    if probe is None or not probe.already_efficient or probe.video_bitrate > 0:
+        return False
+    try:
+        target_kbps_value = int(target or 0)
+    except (TypeError, ValueError):
+        return False
+    if target_kbps_value <= 0 or probe.duration_sec <= 0 or probe.size_bytes <= 0:
+        return False
+    file_kbps = (probe.size_bytes * 8.0) / probe.duration_sec / 1000.0
+    tracks = probe.audio_count if probe.audio_count > 0 else 0
+    room = (target_kbps_value * 1.05) + (128.0 * tracks)
+    return file_kbps <= room
+
+
 def bloat_decision(probe: Probe) -> dict:
     scale = picture_scale(probe.width, probe.height)
     target = target_kbps(probe.width, probe.height)
@@ -774,6 +792,9 @@ def bloat_decision(probe: Probe) -> dict:
         if video_known and probe.video_bitrate <= (target_bps * 1.05):
             decision = 'within'
             reason = 'The picture is already within the target bits per second. Extra size is audio or other tracks, which stay as they are.'
+        elif efficient_file_will_not_shrink(probe, target):
+            decision = 'within'
+            reason = 'The picture rate was not stored. This is already an efficient encode, and a new file at this target would not be smaller.'
         else:
             decision = 'bloated'
             reason = 'Over the budget for this picture size.'

@@ -22,7 +22,7 @@ SECTIONS = [
     ),
     (
         'Scanning',
-        "Choose a folder, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows bloated files and files marked Can shrink, checked and ready to optimize.\n\n"
+        "Choose a folder, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows bloated files and files marked Can shrink, checked and ready to optimize. A file that is already an efficient encode, with no picture rate stored, stays off the list when a new copy would not be smaller.\n\n"
         "Can shrink means the whole file is under the budget line, but the picture is still above the target rate, so a new file should be smaller.\n\n"
         "Select all checks the rows you can see. Deselect all clears every check. Clear removes the scanned files from the list. Files still waiting in .vd-originals stay. Showing all can limit the list to Can shrink, Bloated, Slight, Heavy, Extreme, Failed, Skipped, Ready to delete, or Finished. Hidden rows are unchecked. Select shown checks the visible rows Optimize can take.\n\n"
         "Drag a column edge to change its width. The width is remembered. Drag a heading to move that column. The File column stays first. Drag the bar under the list to make the list taller or shorter. The activity box shrinks first, then Options scrolls. Double-click the bar to put the list back.\n\n"

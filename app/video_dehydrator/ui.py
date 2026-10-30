@@ -179,6 +179,8 @@ class ScanWorker(QThread):
                 elif kind == 'shrink':
                     status = 'Can shrink'
                 else:
+                    if kind == 'within' and 'would not be smaller' in str(decision.get('reason') or ''):
+                        stats['marked'] = stats.get('marked', 0) + 1
                     continue
                 if remembered_skip(self.skips, entry.path, probe.size_bytes, decision['target_kbps'] or 0):
                     stats['ignored'] += 1
@@ -1728,6 +1730,11 @@ class MainWindow(QMainWindow):
                 self.log(f'{shrink} of those are under the line, and the picture can still shrink.', 'text')
             if stats.get('ignored'):
                 self.log(f"{stats['ignored']} files stayed off the list because a smaller copy was not smaller last time.", 'text')
+            marked = int(stats.get('marked') or 0)
+            if marked == 1:
+                self.log('1 file stayed off the list because a new copy would not be smaller.', 'text')
+            elif marked > 1:
+                self.log(f'{marked} files stayed off the list because a new copy would not be smaller.', 'text')
             if stats.get('limited'):
                 found = int(stats.get('hits') or 0)
                 word = 'file' if found == 1 else 'files'

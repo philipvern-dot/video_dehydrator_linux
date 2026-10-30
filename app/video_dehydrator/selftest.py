@@ -104,6 +104,21 @@ def test_rules():
     check(hevc['decision'] == 'lean', 'HEVC under its line is lean')
     dv = bloat_decision(fake_probe(size_bytes=5 * (1024 ** 3), is_dolby_vision=True))
     check(dv['decision'] == 'dv', 'Dolby Vision is left alone')
+    cartoon = bloat_decision(fake_probe(
+        width=354, height=264, size_bytes=18029798, duration_sec=434.654,
+        video_bitrate=0, already_efficient=True, audio_count=1,
+    ))
+    check(cartoon['decision'] == 'within' and cartoon['target_kbps'] == 200, 'an efficient cartoon with no picture rate stays off the list')
+    old_cartoon = bloat_decision(fake_probe(
+        width=354, height=264, size_bytes=18029798, duration_sec=434.654,
+        video_bitrate=0, already_efficient=False, audio_count=1,
+    ))
+    check(old_cartoon['decision'] == 'bloated', 'the same cartoon in an older codec is still listed')
+    fat_hevc = bloat_decision(fake_probe(
+        width=354, height=264, size_bytes=80_000_000, duration_sec=434.654,
+        video_bitrate=0, already_efficient=True, audio_count=1,
+    ))
+    check(fat_hevc['decision'] == 'bloated', 'a fat efficient file with no picture rate is still listed')
     check(harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10'), 'equal dts is harmless')
     check(not harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11 >= 10'), 'a backwards timestamp fails')
     ac3_tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
@@ -171,7 +186,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.9', 'app version')
+    check(app_version() == '1.0.9.10', 'app version')
     check(batch_count_text(4, 100) == '4/100', 'batch count')
     check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
     check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')
@@ -180,6 +195,7 @@ def test_rules():
     check('4/100 means this batch has started file 4 of 100' in guide, 'guide batch count')
     check('Drag a column edge to change its width' in guide, 'guide column width')
     check('each file has its own bar' in guide, 'guide per-file bars')
+    check('already an efficient encode' in guide, 'guide leaves efficient files that will not shrink')
     check(lane_pass_name(1) == 'first pass', 'first pass name')
     check(lane_pass_name(2) == 'pass 2', 'second pass name')
     check(lane_pass_name(0, True) == 'checking', 'checking pass name')
