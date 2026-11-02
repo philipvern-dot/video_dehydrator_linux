@@ -1834,6 +1834,36 @@ def app_version() -> str:
     return __version__
 
 
+def encode_row_key(row) -> str:
+    if not isinstance(row, dict):
+        return ''
+    return str(row.get('source') or row.get('path') or '')
+
+
+def encode_row_snapshot(row):
+    """Plain copy of a table row. The encode threads keep their own copy."""
+    if not isinstance(row, dict):
+        return {}
+    copy = dict(row)
+    audio = copy.get('audio')
+    if isinstance(audio, list):
+        copy['audio'] = list(audio)
+    return copy
+
+
+def apply_encode_snapshot(rows, snapshot) -> bool:
+    """Copy a posted encode result onto the window row with the same source."""
+    posted = encode_row_snapshot(snapshot)
+    key = encode_row_key(posted)
+    if not key:
+        return False
+    for row in rows:
+        if encode_row_key(row) == key:
+            row.update(posted)
+            return True
+    return False
+
+
 def run_lines(command, on_line=None, cancel=None) -> tuple:
     proc = subprocess.Popen(
         command,

@@ -9,7 +9,8 @@ import threading
 import time
 
 from .engine import (
-    Probe, app_version, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
+    Probe, app_version, apply_encode_snapshot, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
+    encode_row_snapshot,
     add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
     job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
     remove_empty_directory, remove_hold_busy_marker, scan_limit_reached,
@@ -186,7 +187,18 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.10', 'app version')
+    check(app_version() == '1.0.9.11', 'app version')
+    window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
+    worker_row = encode_row_snapshot(window_row)
+    worker_row['status'] = 'Converting'
+    worker_row['audio'].append('ac3')
+    check(window_row['status'] == 'Bloated' and window_row['audio'] == ['aac'], 'an encode copy leaves the window row alone')
+    posted = encode_row_snapshot(worker_row)
+    worker_row['status'] = 'Original deleted'
+    check(posted['status'] == 'Converting', 'a posted row stays at the moment it was posted')
+    check(apply_encode_snapshot([window_row], posted), 'the window finds the posted file')
+    check(window_row['status'] == 'Converting' and window_row['audio'] == ['aac', 'ac3'], 'the window applies the posted row')
+    check(not apply_encode_snapshot([window_row], {'status': 'Failed'}), 'a posted row needs a source')
     check(batch_count_text(4, 100) == '4/100', 'batch count')
     check(batch_count_text(5, 100) == '5/100', 'batch count moves to the next file')
     check(batch_count_text(0, 100) == '', 'batch count waits until a file starts')

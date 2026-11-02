@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import math
 import os
+import queue
 import shutil
 import subprocess
 import tarfile
@@ -32,7 +33,7 @@ from .engine import (
     BUDGET_ANCHORS, BUDGET_FACTORS, anchor_budget, app_version, bloat_decision,
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
     LINUX_DOWNLOAD_PREFIX, LINUX_RELEASES, linux_release_asset, linux_release_is_update,
-    add_hold_busy_marker, encoder_name, estimated_savings_bytes, force_convertible, force_video_paths,
+    add_hold_busy_marker, apply_encode_snapshot, encoder_name, encode_row_snapshot, estimated_savings_bytes, force_convertible, force_video_paths,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     lane_bar_text, lane_pass_name,
@@ -278,17 +279,17 @@ class EncodeSlot:
 
 
 class ConvertWorker(QThread):
-    activity = Signal(str, str)
-    progress = Signal(float)
-    lanes = Signal(object)
-    file_update = Signal(object)
-    finished_job = Signal(object)
-    eta = Signal(str)
-    batch_count = Signal(int, int)
+    """Encode files off the window thread.
+
+    Progress is posted on a queue. The window applies it. These threads do not
+    call Qt. A direct signal from a pool thread was crashing the interpreter
+    during long batches.
+    """
 
     def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1):
         super().__init__()
-        self.rows = rows
+        self.rows = [encode_row_snapshot(row) for row in rows]
+        self.events = queue.Queue()
         self.tools = tools
         self.reencode = reencode
         self.delete_original = delete_original
@@ -319,6 +320,12 @@ class ConvertWorker(QThread):
         self._lanes_paint_at = None
         self._eta_shown_at = None
         self._eta_shown_key = ''
+
+    def _post(self, kind, *payload):
+        self.events.put((kind, payload))
+
+    def _post_row(self, row):
+        self._post('file', encode_row_snapshot(row))
 
     def _slot(self) -> EncodeSlot:
         slot = getattr(self._tls, 'slot', None)
@@ -448,7 +455,7 @@ class ConvertWorker(QThread):
             return False
         slot.paint_at = now
         if self.jobs <= 1:
-            self.progress.emit(value)
+            self._post('progress', value)
             return True
         with self._state:
             self._running_percents[id(slot)] = slot.percent
@@ -476,10 +483,10 @@ class ConvertWorker(QThread):
     def _emit_lane_bars(self):
         rows = self._lane_snapshot()
         if len(rows) > 1:
-            self.lanes.emit(rows)
+            self._post('lanes', rows)
             return
-        self.lanes.emit([])
-        self.progress.emit(rows[0]['percent'] if rows else 0)
+        self._post('lanes', [])
+        self._post('progress', rows[0]['percent'] if rows else 0)
 
     def _window_add(self, bucket, value):
         try:
@@ -546,7 +553,7 @@ class ConvertWorker(QThread):
         if self.jobs > 1:
             since = 999.0 if self._eta_shown_at is None else time.monotonic() - self._eta_shown_at
         if key_changed or since >= 30:
-            self.eta.emit(text)
+            self._post('eta', text)
             slot.shown_at = time.monotonic()
             slot.shown_key = key
             if self.jobs > 1:
@@ -579,7 +586,7 @@ class ConvertWorker(QThread):
                 elif self._active == 0:
                     return None
             if taken is not None:
-                self.batch_count.emit(started, len(self.rows))
+                self._post('batch', started, len(self.rows))
                 return taken
             self._resume.wait(0.2)
             self._resume.clear()
@@ -593,6 +600,23 @@ class ConvertWorker(QThread):
         self._resume.set()
 
     def run(self):
+        failed = False
+        try:
+            self._run_lanes()
+        except Exception as exc:
+            failed = True
+            self._post('activity', f'Convert stopped. {exc}', 'err')
+        self._post('eta', '')
+        self._post('done', {
+            'book': self.book,
+            'skips': list(self.skips),
+            'saved': self.saved,
+            'cancelled': self.cancel.is_set() or failed,
+            'stopped_after': self._stopped and not self.cancel.is_set() and not failed,
+            'batch': self.batch,
+        })
+
+    def _run_lanes(self):
         lanes = job_count(self.jobs)
         if len(self.rows) <= 1:
             lanes = 1
@@ -608,7 +632,7 @@ class ConvertWorker(QThread):
             self._running_percents = {}
             self._file_eta = {}
         if lanes > 1:
-            self.activity.emit(f'Parallel jobs is {lanes}. Up to {lanes} files encode at the same time.', 'text')
+            self._post('activity', f'Parallel jobs is {lanes}. Up to {lanes} files encode at the same time.', 'text')
 
         def work(node):
             slot = EncodeSlot()
@@ -642,15 +666,6 @@ class ConvertWorker(QThread):
                 thread.start()
             for thread in threads:
                 thread.join()
-        self.eta.emit('')
-        self.finished_job.emit({
-            'book': self.book,
-            'skips': self.skips,
-            'saved': self.saved,
-            'cancelled': self.cancel.is_set(),
-            'stopped_after': self._stopped and not self.cancel.is_set(),
-            'batch': self.batch,
-        })
 
     def _restore_status(self, row, previous):
         if previous in ('Failed', 'Skipped', 'Can shrink', 'Forced'):
@@ -665,16 +680,16 @@ class ConvertWorker(QThread):
         verb = 'Forcing' if self.force else 'Converting'
         slot = self._slot()
         slot.name = os.path.basename(source)
-        self.activity.emit(f"{verb} {slot.name}.", 'text')
+        self._post('activity', f"{verb} {slot.name}.", 'text')
         row['status'] = 'Converting'
-        self.file_update.emit(row)
+        self._post_row(row)
         self._reset_clock()
         slot.name = os.path.basename(source)
         self._set_progress(0)
         self._emit_eta()
         if self.cancel.is_set():
             self._restore_status(row, previous)
-            self.file_update.emit(row)
+            self._post_row(row)
             return
         try:
             probe = probe_file(str(self.tools['ffprobe']), source)
@@ -682,16 +697,16 @@ class ConvertWorker(QThread):
             row['status'] = 'Failed'
             row['reason'] = str(exc)
             row['checked'] = True
-            self.activity.emit(f'Could not read {os.path.basename(source)}. {exc}', 'err')
-            self.file_update.emit(row)
+            self._post('activity', f'Could not read {os.path.basename(source)}. {exc}', 'err')
+            self._post_row(row)
             return
         decision = bloat_decision(probe)
         if self.force and not force_convertible(decision):
             row['status'] = 'Left alone'
             row['checked'] = False
             row['reason'] = decision.get('reason') or 'Left alone.'
-            self.activity.emit(f"Left {os.path.basename(source)} alone. {row['reason']}", 'text')
-            self.file_update.emit(row)
+            self._post('activity', f"Left {os.path.basename(source)} alone. {row['reason']}", 'text')
+            self._post_row(row)
             return
         slot = self._slot()
         row['ten_bit'] = encoder_name(probe) == 'x265_10bit'
@@ -705,8 +720,8 @@ class ConvertWorker(QThread):
             row['status'] = 'Failed'
             row['reason'] = 'A file already has the new name.'
             row['checked'] = True
-            self.activity.emit(row['reason'] + ' ' + plan['final'], 'err')
-            self.file_update.emit(row)
+            self._post('activity', row['reason'] + ' ' + plan['final'], 'err')
+            self._post_row(row)
             return
         os.makedirs(plan['hold_dir'], exist_ok=True)
         encoder = encoder_name(probe)
@@ -738,7 +753,7 @@ class ConvertWorker(QThread):
                         self._emit_eta()
                 elif self.detailed and line and not is_encode_progress_line(line):
                     prefix = f'{os.path.basename(source)}  ' if self.jobs > 1 else ''
-                    self.activity.emit(prefix + line, 'dim')
+                    self._post('activity', prefix + line, 'dim')
 
             code, _joined = run_lines(command, on_line, self.cancel)
             handbrake_log = '\n'.join(log_lines)
@@ -749,13 +764,13 @@ class ConvertWorker(QThread):
                 output_retries += 1
                 if os.path.isfile(plan['temp']):
                     os.remove(plan['temp'])
-                self.activity.emit(f'The output folder was missing for {os.path.basename(source)}. Trying the two-pass encode again.', 'text')
+                self._post('activity', f'The output folder was missing for {os.path.basename(source)}. Trying the two-pass encode again.', 'text')
                 continue
             if missing_file and not single_pass and not output_path_missing(handbrake_log) and pass_two_did_not_start(handbrake_log):
                 single_pass = True
                 if os.path.isfile(plan['temp']):
                     os.remove(plan['temp'])
-                self.activity.emit(f'The two-pass encode did not start for {os.path.basename(source)}. Trying one pass.', 'text')
+                self._post('activity', f'The two-pass encode did not start for {os.path.basename(source)}. Trying one pass.', 'text')
                 continue
             break
         if self.cancel.is_set():
@@ -764,8 +779,8 @@ class ConvertWorker(QThread):
                 os.remove(plan['temp'])
             remove_empty_directory(plan['hold_dir'], self.book)
             self._restore_status(row, previous)
-            self.activity.emit(f"Stopped {os.path.basename(source)}. The original stayed.", 'text')
-            self.file_update.emit(row)
+            self._post('activity', f"Stopped {os.path.basename(source)}. The original stayed.", 'text')
+            self._post_row(row)
             return
         if code != 0 or not os.path.isfile(plan['temp']):
             remove_hold_busy_marker(plan)
@@ -776,8 +791,8 @@ class ConvertWorker(QThread):
             row['checked'] = True
             row['reason'] = f'HandBrake stopped ({code}).'
             append_convert_log('FAIL', row['reason'], source, '', '', probe.size_bytes, 0, 0, 0, probe.width, probe.height, kbps)
-            self.activity.emit(f"Failed {os.path.basename(source)}. {row['reason']}", 'err')
-            self.file_update.emit(row)
+            self._post('activity', f"Failed {os.path.basename(source)}. {row['reason']}", 'err')
+            self._post_row(row)
             return
         self._remember_finished()
         self._slot().checking = True
@@ -802,14 +817,14 @@ class ConvertWorker(QThread):
                 with self._state:
                     self.skips = merge_skip_row(self.skips, source, probe.size_bytes, kbps or 0)
                 append_convert_log('SKIP', row['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-                self.activity.emit('Skipped. ' + row['reason'], 'text')
+                self._post('activity', 'Skipped. ' + row['reason'], 'text')
             else:
                 row['status'] = 'Failed'
                 row['checked'] = True
                 row['reason'] = checked['reason']
                 append_convert_log('FAIL', checked['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-                self.activity.emit(f"Failed {os.path.basename(source)}. {checked['reason']}", 'err')
-            self.file_update.emit(row)
+                self._post('activity', f"Failed {os.path.basename(source)}. {checked['reason']}", 'err')
+            self._post_row(row)
             return
         try:
             with self._state:
@@ -818,8 +833,8 @@ class ConvertWorker(QThread):
             row['status'] = 'Failed'
             row['reason'] = str(exc)
             row['checked'] = True
-            self.activity.emit(f'Could not replace {os.path.basename(source)}. {exc}', 'err')
-            self.file_update.emit(row)
+            self._post('activity', f'Could not replace {os.path.basename(source)}. {exc}', 'err')
+            self._post_row(row)
             return
         row['new'] = swap['new_path']
         row['path'] = swap['new_path']
@@ -844,9 +859,9 @@ class ConvertWorker(QThread):
             append_convert_log('KEPT', 'ok', source, swap['new_path'], swap['kept_path'], swap['old_bytes'], swap['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
         with self._state:
             self.skips = remove_skip_row(self.skips, source)
-        self.activity.emit(f"Finished {row['name']}.", 'ok')
+        self._post('activity', f"Finished {row['name']}.", 'ok')
         self._set_progress(100)
-        self.file_update.emit(row)
+        self._post_row(row)
 
 
 class ForceWorker(QThread):
@@ -1027,6 +1042,9 @@ class MainWindow(QMainWindow):
         self.work = 'idle'
         self.cancel = threading.Event()
         self.worker = None
+        self._convert_timer = QTimer(self)
+        self._convert_timer.setInterval(50)
+        self._convert_timer.timeout.connect(self._drain_convert_events)
         self.awake = Awake()
         self.loading = True
         self.saved_bytes = 0
@@ -1804,14 +1822,8 @@ class MainWindow(QMainWindow):
             self.detailed.isChecked(), self.skips, self.cancel, force=force,
             jobs=job_count(self.jobs_box.currentData()),
         )
-        self.worker.activity.connect(self.log)
-        self.worker.progress.connect(self._set_single_progress)
-        self.worker.lanes.connect(self.set_lanes)
-        self.worker.file_update.connect(self.on_file_update)
-        self.worker.eta.connect(self.set_eta)
-        self.worker.batch_count.connect(self.set_batch_count)
-        self.worker.finished_job.connect(self.convert_finished)
         self.worker.start()
+        self._convert_timer.start()
         self.set_lanes([])
         self.progress.setValue(0)
         self.progress.setVisible(True)
@@ -1894,7 +1906,35 @@ class MainWindow(QMainWindow):
                 self.offer_shutdown()
         self._refresh()
 
+    def _drain_convert_events(self):
+        worker = self.worker
+        if worker is None:
+            self._convert_timer.stop()
+            return
+        for _ in range(200):
+            try:
+                kind, payload = worker.events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == 'activity':
+                self.log(payload[0], payload[1])
+            elif kind == 'progress':
+                self._set_single_progress(payload[0])
+            elif kind == 'lanes':
+                self.set_lanes(payload[0])
+            elif kind == 'file':
+                self.on_file_update(payload[0])
+            elif kind == 'eta':
+                self.set_eta(payload[0])
+            elif kind == 'batch':
+                self.set_batch_count(payload[0], payload[1])
+            elif kind == 'done':
+                self._convert_timer.stop()
+                self.convert_finished(payload[0])
+                return
+
     def on_file_update(self, row):
+        apply_encode_snapshot(self.rows, row)
         if row.get('status') == 'Ready to delete' and row.get('pending_id'):
             self._sync_pending()
         self.refill()
