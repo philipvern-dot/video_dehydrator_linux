@@ -1,10 +1,14 @@
 # Video Dehydrator for Linux
 
-This is the Linux copy of Video Dehydrator 1.0.9.11. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
+This is the Linux copy of Video Dehydrator 1.0.9.12. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
 
 The picture rules match Windows 1.0.9.5: the same x265 medium two-pass rates, the same audio copy, and the same checks. A file made on this computer will not be byte-for-byte the same as a file made on the Windows PC. The target rate is the same, so the size and the kind of picture stay the same.
 
 The Windows program stays in the `windows` folder. This copy does not change it.
+
+## What's new in 1.0.9.12
+
+The check at the end of a file keeps a good encode when the only extra note is an MP3 "invalid new backstep" warning. FFmpeg prints that when it seeks into copied MP3, then keeps decoding. Peter and the Wolf was one of these: the new file was smaller, the picture matched, and that warning was the only note. A missing MP3 header, a picture error, or any other decoder failure still fails the file.
 
 ## What's new in 1.0.9.11
 

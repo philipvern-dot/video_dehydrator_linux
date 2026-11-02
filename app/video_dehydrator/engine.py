@@ -1274,6 +1274,16 @@ def equal_timestamp_line(text: str) -> bool:
     return bool(match and match.group(1) == match.group(2))
 
 
+def mp3_new_backstep_line(text: str) -> bool:
+    """FFmpeg logs this when a seek lands in copied MP3, then keeps decoding."""
+    if text is None or not str(text).strip():
+        return False
+    return bool(re.match(
+        r'^\[mp3(?:float)? @ [0-9A-Fa-fx]+\] invalid new backstep -\d+\s*$',
+        str(text).strip(),
+    ))
+
+
 def harmless_decode_note(text: str) -> bool:
     if text is None or not str(text).strip():
         return True
@@ -1281,8 +1291,9 @@ def harmless_decode_note(text: str) -> bool:
     if not lines:
         return True
     for line in lines:
-        if not equal_timestamp_line(line):
-            return False
+        if equal_timestamp_line(line) or mp3_new_backstep_line(line):
+            continue
+        return False
     return True
 
 
@@ -1298,8 +1309,9 @@ def decode_window(ffmpeg: str, file_path: str, duration_sec: float, window: str)
     args += ['-t', str(seconds), '-i', file_path, '-f', 'null', '-']
     code, out, err = run_captured(args)
     detail = ' | '.join(part for part in re.split(r'\r?\n', (out + '\n' + err)) if part and part.strip())
-    # -xerror turns a repeated equal timestamp into a non-zero exit. Those
-    # notes are harmless on their own. A blank failure is still a failure.
+    # -xerror can turn a recovered decoder note into a non-zero exit.
+    # Equal timestamps and an MP3 backstep warning are recovered notes.
+    # A blank failure is still a failure.
     if harmless_decode_note(detail) and str(detail).strip():
         return {'ok': True, 'detail': ''}
     if code != 0 or not harmless_decode_note(detail):

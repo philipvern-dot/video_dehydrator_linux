@@ -122,6 +122,13 @@ def test_rules():
     check(fat_hevc['decision'] == 'bloated', 'a fat efficient file with no picture rate is still listed')
     check(harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10'), 'equal dts is harmless')
     check(not harmless_decode_note('Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11 >= 10'), 'a backwards timestamp fails')
+    backstep = '[mp3float @ 0x25992d40] invalid new backstep -1'
+    check(harmless_decode_note(backstep), 'a recovered MP3 backstep warning is harmless')
+    check(harmless_decode_note(backstep + ' | Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10'), 'backstep plus an equal timestamp is harmless')
+    check(not harmless_decode_note(backstep + ' | [mp3float @ 0x25992d40] Header missing'), 'a missing MP3 header stays a failure')
+    check(not harmless_decode_note('[mp3float @ 0x25992d40] invalid old backstep -1'), 'an old backstep warning stays a failure')
+    check(not harmless_decode_note('[mp3float @ 0x25992d40] invalid new backstep 4'), 'a positive backstep value stays a failure')
+    check(not harmless_decode_note(backstep + ' | [mpeg4 @ 00000001] error while decoding'), 'a picture error stays a failure beside the MP3 note')
     ac3_tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
     check(trailing_ac3_note(ac3_tail), 'one trailing incomplete AC3 frame is the allowed note')
     same_stamp = '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10 | [null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 18 >= 18'
@@ -187,7 +194,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.11', 'app version')
+    check(app_version() == '1.0.9.12', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
