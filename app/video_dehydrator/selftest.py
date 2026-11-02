@@ -194,7 +194,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.12', 'app version')
+    check(app_version() == '1.0.9.13', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -450,9 +450,68 @@ def test_recycle():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _class_body(source, name):
+    chunk = source.split(f'class {name}', 1)[1]
+    # Stop at the next top-level class or function.
+    lines = []
+    for line in chunk.splitlines()[1:]:
+        if line.startswith('class ') or line.startswith('def '):
+            break
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def test_scan_posts_events():
+    source = open(os.path.join(os.path.dirname(__file__), 'ui.py'), encoding='utf-8').read()
+    scan = _class_body(source, 'ScanWorker')
+    manual = _class_body(source, 'ForceWorker')
+    check("self._post('done'" in scan, 'scan posts a done event')
+    check("self._post('hit'" in scan, 'scan posts each listed file')
+    check('.emit(' not in scan, 'scan does not emit a Qt signal')
+    check("self._post('done'" in manual, 'a manual walk posts a done event')
+    check('.emit(' not in manual, 'a manual walk does not emit a Qt signal')
+    try:
+        import queue
+        from PySide6.QtCore import QCoreApplication
+        from .ui import ForceWorker, ScanWorker
+    except ImportError:
+        return
+    if QCoreApplication.instance() is None:
+        QCoreApplication([])
+    root = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(root, 'Season', '.vd-originals'))
+        with open(os.path.join(root, 'Season', 'note.txt'), 'w', encoding='utf-8') as handle:
+            handle.write('not a video')
+        worker = ScanWorker(root, True, 'ffprobe', [], threading.Event(), 0)
+        worker.run()
+        events = []
+        while True:
+            try:
+                events.append(worker.events.get_nowait())
+            except queue.Empty:
+                break
+        check(events and events[-1][0] == 'done', 'scan posts a done event')
+        check(events[-1][1][0]['seen'] == 0, 'a text file is not listed')
+        check(all(kind != 'hit' for kind, _payload in events), 'a text file posts no hit')
+        walked_worker = ForceWorker(root, True, False, 'ffprobe', threading.Event())
+        walked_worker.run()
+        walked = []
+        while True:
+            try:
+                walked.append(walked_worker.events.get_nowait())
+            except queue.Empty:
+                break
+        check(walked and walked[-1][0] == 'done', 'a manual walk posts a done event')
+        check(walked[-1][1][0]['files'] == [], 'a manual walk skips a text file')
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_rules()
     test_recycle()
+    test_scan_posts_events()
     print('SELF TEST OK')
     return 0
 

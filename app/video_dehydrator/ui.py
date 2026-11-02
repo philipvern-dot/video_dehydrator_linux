@@ -126,77 +126,86 @@ class Awake:
 
 
 class ScanWorker(QThread):
-    hit = Signal(object)
-    progress = Signal(int, int, str)
-    finished_scan = Signal(object)
+    """List files off the window thread.
+
+    Hits are posted on a queue. The window applies them. This thread does not
+    call Qt. A direct signal from this thread was crashing the interpreter
+    during a long scan.
+    """
 
     def __init__(self, root, recurse, ffprobe, skips, cancel, limit=0):
         super().__init__()
         self.root = root
         self.recurse = recurse
         self.ffprobe = ffprobe
-        self.skips = skips
+        self.skips = list(skips)
         self.cancel = cancel
         self.limit = int(limit or 0)
+        self.events = queue.Queue()
+
+    def _post(self, kind, *payload):
+        self.events.put((kind, payload))
 
     def run(self):
         stats = {'seen': 0, 'hits': 0, 'errors': 0, 'ignored': 0, 'cancelled': False}
-        stack = [self.root]
-        while stack:
-            if self.cancel.is_set():
-                stats['cancelled'] = True
-                break
-            directory = stack.pop()
-            try:
-                with os.scandir(directory) as scan:
-                    names = list(scan)
-            except OSError:
-                stats['errors'] += 1
-                continue
-            for entry in names:
+        try:
+            stack = [self.root]
+            while stack:
                 if self.cancel.is_set():
                     stats['cancelled'] = True
-                    stack = []
                     break
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name == '.vd-originals':
-                        continue
-                    if self.recurse:
-                        stack.append(entry.path)
-                    continue
-                if not entry.is_file(follow_symlinks=False) or not is_video_file(entry.path):
-                    continue
-                stats['seen'] += 1
-                self.progress.emit(stats['seen'], stats['hits'], entry.name)
+                directory = stack.pop()
                 try:
-                    probe = probe_file(self.ffprobe, entry.path)
-                    decision = bloat_decision(probe)
-                except Exception:
+                    with os.scandir(directory) as scan:
+                        names = list(scan)
+                except OSError:
                     stats['errors'] += 1
                     continue
-                kind = decision['decision']
-                if kind == 'bloated':
-                    status = 'Bloated'
-                elif kind == 'shrink':
-                    status = 'Can shrink'
-                else:
-                    if kind == 'within' and 'would not be smaller' in str(decision.get('reason') or ''):
-                        stats['marked'] = stats.get('marked', 0) + 1
-                    continue
-                if remembered_skip(self.skips, entry.path, probe.size_bytes, decision['target_kbps'] or 0):
-                    stats['ignored'] += 1
-                    continue
-                stats['hits'] += 1
-                if status == 'Can shrink':
-                    stats['shrink'] = stats.get('shrink', 0) + 1
-                self.hit.emit(row_from_probe(entry.path, probe, decision, status))
-                if scan_limit_reached(stats['hits'], self.limit):
-                    stats['limited'] = True
-                    stack = []
+                for entry in names:
+                    if self.cancel.is_set():
+                        stats['cancelled'] = True
+                        stack = []
+                        break
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name == '.vd-originals':
+                            continue
+                        if self.recurse:
+                            stack.append(entry.path)
+                        continue
+                    if not entry.is_file(follow_symlinks=False) or not is_video_file(entry.path):
+                        continue
+                    stats['seen'] += 1
+                    self._post('progress', stats['seen'], stats['hits'], entry.name)
+                    try:
+                        probe = probe_file(self.ffprobe, entry.path)
+                        decision = bloat_decision(probe)
+                    except Exception:
+                        stats['errors'] += 1
+                        continue
+                    kind = decision['decision']
+                    if kind == 'bloated':
+                        status = 'Bloated'
+                    elif kind == 'shrink':
+                        status = 'Can shrink'
+                    else:
+                        if kind == 'within' and 'would not be smaller' in str(decision.get('reason') or ''):
+                            stats['marked'] = stats.get('marked', 0) + 1
+                        continue
+                    if remembered_skip(self.skips, entry.path, probe.size_bytes, decision['target_kbps'] or 0):
+                        stats['ignored'] += 1
+                        continue
+                    stats['hits'] += 1
+                    if status == 'Can shrink':
+                        stats['shrink'] = stats.get('shrink', 0) + 1
+                    self._post('hit', row_from_probe(entry.path, probe, decision, status))
+                    if scan_limit_reached(stats['hits'], self.limit):
+                        stats['limited'] = True
+                        stack = []
+                        break
+                if stats.get('limited'):
                     break
-            if stats.get('limited'):
-                break
-        self.finished_scan.emit(stats)
+        finally:
+            self._post('done', dict(stats))
 
 
 def row_from_probe(path, probe, decision, status):
@@ -865,8 +874,10 @@ class ConvertWorker(QThread):
 
 
 class ForceWorker(QThread):
-    progress = Signal(int, str)
-    finished_walk = Signal(object)
+    """Walk a manual folder off the window thread.
+
+    Progress is posted on a queue. This thread does not call Qt.
+    """
 
     def __init__(self, path, recurse, probe_files, ffprobe, cancel):
         super().__init__()
@@ -875,20 +886,24 @@ class ForceWorker(QThread):
         self.probe_files = probe_files
         self.ffprobe = ffprobe
         self.cancel = cancel
+        self.events = queue.Queue()
+
+    def _post(self, kind, *payload):
+        self.events.put((kind, payload))
 
     def run(self):
         files = []
         try:
             paths = force_video_paths(self.path, self.recurse)
         except Exception as exc:
-            self.finished_walk.emit({'cancelled': False, 'files': [], 'error': str(exc)})
+            self._post('done', {'cancelled': False, 'files': [], 'error': str(exc)})
             return
         for index, file_path in enumerate(paths, 1):
             if self.cancel.is_set():
-                self.finished_walk.emit({'cancelled': True, 'files': files})
+                self._post('done', {'cancelled': True, 'files': files})
                 return
             name = os.path.basename(file_path)
-            self.progress.emit(index, name)
+            self._post('reading', index, name)
             if not self.probe_files:
                 try:
                     size = os.path.getsize(file_path)
@@ -936,7 +951,7 @@ class ForceWorker(QThread):
                     'budget': None, 'over': None, 'video_bitrate': 0, 'codec': '', 'anchor': '',
                     'probe': None, 'decision': 'error',
                 })
-        self.finished_walk.emit({'cancelled': False, 'files': files})
+        self._post('done', {'cancelled': False, 'files': files})
 
 
 def _check_mark_path() -> str:
@@ -1045,6 +1060,10 @@ class MainWindow(QMainWindow):
         self._convert_timer = QTimer(self)
         self._convert_timer.setInterval(50)
         self._convert_timer.timeout.connect(self._drain_convert_events)
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(50)
+        self._scan_timer.timeout.connect(self._drain_scan_events)
+        self._scan_draining = False
         self.awake = Awake()
         self.loading = True
         self.saved_bytes = 0
@@ -1721,9 +1740,7 @@ class MainWindow(QMainWindow):
         self.awake.start()
         self.status.setText('Listing videos...')
         self.worker = ScanWorker(root, self.subfolders.isChecked(), str(self.tools['ffprobe']), self.skips, self.cancel, int(self.find_box.currentData() or 0))
-        self.worker.hit.connect(self.add_hit)
-        self.worker.progress.connect(self.on_scan_progress)
-        self.worker.finished_scan.connect(self.scan_finished)
+        self._scan_timer.start()
         self.worker.start()
         self._refresh()
 
@@ -1817,6 +1834,7 @@ class MainWindow(QMainWindow):
         self.set_eta('')
         if self.shutdown.isChecked():
             self.log('The computer will shut down when this convert finishes.', 'text')
+        self._scan_timer.stop()
         self.worker = ConvertWorker(
             chosen, self.tools, self.reencode.isChecked(), self.auto.isChecked(),
             self.detailed.isChecked(), self.skips, self.cancel, force=force,
@@ -1905,6 +1923,37 @@ class MainWindow(QMainWindow):
             elif self.shutdown.isChecked():
                 self.offer_shutdown()
         self._refresh()
+
+    def _drain_scan_events(self):
+        if self._scan_draining:
+            return
+        worker = self.worker
+        if worker is None or not hasattr(worker, 'events'):
+            self._scan_timer.stop()
+            return
+        self._scan_draining = True
+        try:
+            for _ in range(40):
+                try:
+                    kind, payload = worker.events.get_nowait()
+                except queue.Empty:
+                    return
+                if kind == 'progress':
+                    self.on_scan_progress(*payload)
+                elif kind == 'hit':
+                    self.add_hit(payload[0])
+                elif kind == 'reading':
+                    seen, name = payload
+                    self.status.setText(f'Reading files... {seen}. {name}')
+                elif kind == 'done':
+                    self._scan_timer.stop()
+                    if isinstance(worker, ForceWorker):
+                        self.force_finished(payload[0])
+                    else:
+                        self.scan_finished(payload[0])
+                    return
+        finally:
+            self._scan_draining = False
 
     def _drain_convert_events(self):
         worker = self.worker
@@ -2049,8 +2098,7 @@ class MainWindow(QMainWindow):
             choice['path'], choice['recurse'] and os.path.isdir(choice['path']),
             choice['mode'] == 'test', str(self.tools['ffprobe']), self.cancel,
         )
-        self.worker.progress.connect(lambda seen, name: self.status.setText(f'Reading files... {seen}. {name}'))
-        self.worker.finished_walk.connect(self.force_finished)
+        self._scan_timer.start()
         self.worker.start()
         self._refresh()
 
