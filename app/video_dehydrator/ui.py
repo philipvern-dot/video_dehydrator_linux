@@ -37,7 +37,7 @@ from .engine import (
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     lane_bar_text, lane_pass_name,
-    is_encode_progress_line, is_video_file, larger_file_note,
+    is_encode_progress_line, is_video_file, larger_file_note, FIND_LIMITS,
     batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
     output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
@@ -125,16 +125,16 @@ class Awake:
         self.proc = None
 
 
-class ScanWorker(QThread):
+class ScanWorker(threading.Thread):
     """List files off the window thread.
 
-    Hits are posted on a queue. The window applies them. This thread does not
-    call Qt. A direct signal from this thread was crashing the interpreter
-    during a long scan.
+    Hits are posted on a queue. The window applies them. This is a normal
+    Python thread. A Qt thread crashed the interpreter while a scan was
+    reading a file name.
     """
 
     def __init__(self, root, recurse, ffprobe, skips, cancel, limit=0):
-        super().__init__()
+        super().__init__(name='vd-scan', daemon=True)
         self.root = root
         self.recurse = recurse
         self.ffprobe = ffprobe
@@ -146,6 +146,24 @@ class ScanWorker(QThread):
     def _post(self, kind, *payload):
         self.events.put((kind, payload))
 
+    def _list_dir(self, directory, stats):
+        found = []
+        try:
+            with os.scandir(directory) as scan:
+                for entry in scan:
+                    try:
+                        name = entry.name
+                        path = entry.path
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        is_file = False if is_dir else entry.is_file(follow_symlinks=False)
+                    except OSError:
+                        stats['errors'] += 1
+                        continue
+                    found.append((name, path, is_dir, is_file))
+        except OSError:
+            stats['errors'] += 1
+        return found
+
     def run(self):
         stats = {'seen': 0, 'hits': 0, 'errors': 0, 'ignored': 0, 'cancelled': False}
         try:
@@ -155,29 +173,23 @@ class ScanWorker(QThread):
                     stats['cancelled'] = True
                     break
                 directory = stack.pop()
-                try:
-                    with os.scandir(directory) as scan:
-                        names = list(scan)
-                except OSError:
-                    stats['errors'] += 1
-                    continue
-                for entry in names:
+                for name, path, is_dir, is_file in self._list_dir(directory, stats):
                     if self.cancel.is_set():
                         stats['cancelled'] = True
                         stack = []
                         break
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name == '.vd-originals':
+                    if is_dir:
+                        if name == '.vd-originals':
                             continue
                         if self.recurse:
-                            stack.append(entry.path)
+                            stack.append(path)
                         continue
-                    if not entry.is_file(follow_symlinks=False) or not is_video_file(entry.path):
+                    if not is_file or not is_video_file(path):
                         continue
                     stats['seen'] += 1
-                    self._post('progress', stats['seen'], stats['hits'], entry.name)
+                    self._post('progress', stats['seen'], stats['hits'], name)
                     try:
-                        probe = probe_file(self.ffprobe, entry.path)
+                        probe = probe_file(self.ffprobe, path)
                         decision = bloat_decision(probe)
                     except Exception:
                         stats['errors'] += 1
@@ -191,13 +203,13 @@ class ScanWorker(QThread):
                         if kind == 'within' and 'would not be smaller' in str(decision.get('reason') or ''):
                             stats['marked'] = stats.get('marked', 0) + 1
                         continue
-                    if remembered_skip(self.skips, entry.path, probe.size_bytes, decision['target_kbps'] or 0):
+                    if remembered_skip(self.skips, path, probe.size_bytes, decision['target_kbps'] or 0):
                         stats['ignored'] += 1
                         continue
                     stats['hits'] += 1
                     if status == 'Can shrink':
                         stats['shrink'] = stats.get('shrink', 0) + 1
-                    self._post('hit', row_from_probe(entry.path, probe, decision, status))
+                    self._post('hit', row_from_probe(path, probe, decision, status))
                     if scan_limit_reached(stats['hits'], self.limit):
                         stats['limited'] = True
                         stack = []
@@ -873,14 +885,14 @@ class ConvertWorker(QThread):
         self._post_row(row)
 
 
-class ForceWorker(QThread):
+class ForceWorker(threading.Thread):
     """Walk a manual folder off the window thread.
 
-    Progress is posted on a queue. This thread does not call Qt.
+    Progress is posted on a queue. This is a normal Python thread.
     """
 
     def __init__(self, path, recurse, probe_files, ffprobe, cancel):
-        super().__init__()
+        super().__init__(name='vd-force', daemon=True)
         self.path = path
         self.recurse = recurse
         self.probe_files = probe_files
@@ -1296,7 +1308,7 @@ class MainWindow(QMainWindow):
         self.jobs_box.setToolTip(jobs_tip)
         self.find_box = QComboBox()
         self.find_box.addItem('All', 0)
-        for count in (5, 10, 25, 50, 100):
+        for count in FIND_LIMITS:
             self.find_box.addItem(str(count), count)
         try:
             saved_find = int(self.settings.get('findLimit') or 0)
@@ -1305,7 +1317,7 @@ class MainWindow(QMainWindow):
         find_index = self.find_box.findData(saved_find)
         self.find_box.setCurrentIndex(find_index if find_index >= 0 else 0)
         self.find_box.currentIndexChanged.connect(self.persist)
-        find_tip = 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
+        find_tip = 'Stop scanning after this many files that can be reduced. 500 and 1000 cover a long list. All keeps scanning the whole folder.'
         find_label = QLabel('Find')
         find_label.setToolTip(find_tip)
         self.find_box.setToolTip(find_tip)
@@ -1746,7 +1758,18 @@ class MainWindow(QMainWindow):
 
     def add_hit(self, row):
         self.rows.append(row)
-        self.refill()
+        if self.work != 'scan' or not self.row_shown(row):
+            self.refill()
+            return
+        self.loading = True
+        try:
+            self.add_table_row(row)
+            parent = os.path.dirname(row.get('source') or row['path'])
+            if row['status'] in FOLDER_STATUSES and parent and self.folder_pick.findText(parent) < 0:
+                self.folder_pick.addItem(parent)
+        finally:
+            self.loading = False
+        self.update_savings()
 
     def on_scan_progress(self, seen, hits, name):
         self.status.setText(f'Listing videos... {seen} seen, {hits} listed. {name}')
@@ -1774,7 +1797,7 @@ class MainWindow(QMainWindow):
                 found = int(stats.get('hits') or 0)
                 word = 'file' if found == 1 else 'files'
                 self.log(f'Stopped scanning after {found} {word} that can be reduced.', 'text')
-        self._refresh()
+        self.refill()
 
     def auto_ask(self) -> bool:
         if not self.auto.isChecked() or self.settings.get('autoAsk') is False:

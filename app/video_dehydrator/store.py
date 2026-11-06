@@ -22,6 +22,8 @@ DEFAULTS = {
     'autoAsk': True,
     'purgeRecycle': False,
     'recycleAlertMuted': False,
+    'jobs': 1,
+    'findLimit': 0,
     'listExtra': 0,
     'columnOrder': [],
     'columnWidths': {},
@@ -48,6 +50,20 @@ def load_settings() -> dict:
         settings['listExtra'] = int(settings.get('listExtra') or 0)
     except (TypeError, ValueError):
         settings['listExtra'] = 0
+    try:
+        settings['jobs'] = int(settings.get('jobs') or 1)
+    except (TypeError, ValueError):
+        settings['jobs'] = 1
+    if settings['jobs'] < 1:
+        settings['jobs'] = 1
+    if settings['jobs'] > 6:
+        settings['jobs'] = 6
+    try:
+        settings['findLimit'] = int(settings.get('findLimit') or 0)
+    except (TypeError, ValueError):
+        settings['findLimit'] = 0
+    if settings['findLimit'] < 0:
+        settings['findLimit'] = 0
     order = settings.get('columnOrder')
     settings['columnOrder'] = [str(name) for name in order] if isinstance(order, list) else []
     settings['columnWidths'] = clean_column_widths(settings.get('columnWidths'))

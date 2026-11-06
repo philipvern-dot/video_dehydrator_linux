@@ -12,7 +12,7 @@ from .engine import (
     Probe, app_version, apply_encode_snapshot, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
     encode_row_snapshot,
     add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
-    job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
+    FIND_LIMITS, job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
     remove_empty_directory, remove_hold_busy_marker, scan_limit_reached,
     ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
     encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
@@ -194,7 +194,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.13', 'app version')
+    check(app_version() == '1.0.9.14', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -223,6 +223,10 @@ def test_rules():
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')
+    check(FIND_LIMITS == (5, 10, 25, 50, 100, 500, 1000), 'scan limits include 500 and 1000')
+    check(scan_limit_reached(500, 500) and not scan_limit_reached(499, 500), '500 scan limit')
+    check(scan_limit_reached(1000, 1000) and not scan_limit_reached(999, 1000), '1000 scan limit')
+    check('100, 500, or 1000' in guide, 'guide scan limits')
     check(output_path_missing('ERROR: avio_open2 failed, errno -2: Could not write'), 'a missing output folder was missed')
     check(not output_path_missing('encoded 0 frames\nEncoding: task 2 of 2, 0.00 %'), 'a failed second pass looked like a missing folder')
     check(pass_two_did_not_start('encoded 0 frames\nEncoding: task 2 of 2, 0.00 %'), 'a second pass that never started was missed')

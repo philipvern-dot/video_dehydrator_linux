@@ -993,6 +993,9 @@ def job_count(value) -> int:
     return number
 
 
+FIND_LIMITS = (5, 10, 25, 50, 100, 500, 1000)
+
+
 def scan_limit_reached(found, limit) -> bool:
     try:
         cap = int(limit)
