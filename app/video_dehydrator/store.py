@@ -157,6 +157,24 @@ def write_skips(rows) -> None:
     path.write_text(json.dumps(clean, indent=2) + '\n', encoding='utf-8')
 
 
+def read_faults() -> list:
+    path = _path('faults.json')
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [row for row in flatten_rows(payload) if isinstance(row, dict) and row.get('source')]
+
+
+def write_faults(rows) -> None:
+    path = _path('faults.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean = [row for row in rows or [] if isinstance(row, dict) and row.get('source')]
+    path.write_text(json.dumps(clean, indent=2) + '\n', encoding='utf-8')
+
+
 def append_convert_log(status, reason, source, new_path, kept, old_bytes, new_bytes, old_rate, new_rate, width, height, kbps) -> None:
     path = _path('convert-log.tsv')
     path.parent.mkdir(parents=True, exist_ok=True)

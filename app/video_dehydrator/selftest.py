@@ -18,7 +18,8 @@ from .engine import (
     encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
     lane_bar_text, lane_pass_name,
     median_sample,
-    harmless_decode_note, merge_skip_row, over_band_id, remaining_estimate,
+    FAULT_ISSUE_URL, fault_issue_request, format_fault_report, useful_handbrake_lines,
+    harmless_decode_note, make_fault_record, merge_fault, merge_skip_row, over_band_id, remaining_estimate,
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
@@ -129,6 +130,58 @@ def test_rules():
     check(not harmless_decode_note('[mp3float @ 0x25992d40] invalid old backstep -1'), 'an old backstep warning stays a failure')
     check(not harmless_decode_note('[mp3float @ 0x25992d40] invalid new backstep 4'), 'a positive backstep value stays a failure')
     check(not harmless_decode_note(backstep + ' | [mpeg4 @ 00000001] error while decoding'), 'a picture error stays a failure beside the MP3 note')
+    aac_noise = '[aac @ 0xf8f3180] noise_facs_q 255 is invalid'
+    aac_env = '[aac @ 0x46d12c00] env_facs_q 254 is invalid'
+    check(harmless_decode_note(aac_noise), 'a recovered HE-AAC noise factor warning is harmless')
+    check(harmless_decode_note(aac_env + ' | Last message repeated 3 times'), 'an HE-AAC envelope warning and its repeat are harmless')
+    check(harmless_decode_note(aac_noise + ' | ' + aac_env + ' | Application provided invalid, non monotonically increasing dts to muxer in stream 0: 210 >= 210'), 'HE-AAC factor warnings plus an equal timestamp are harmless')
+    check(not harmless_decode_note(aac_noise + ' | [mpeg4 @ 00000001] error while decoding'), 'a picture error stays a failure beside the HE-AAC note')
+    check(not harmless_decode_note('[aac @ 0xf8f3180] Prediction is not allowed in AAC-LC'), 'another AAC error stays a failure')
+    check(not harmless_decode_note('Last message repeated 3 times | [h264 @ 00000001] error while decoding'), 'a repeated line does not hide a picture error')
+    notes = useful_handbrake_lines('Encoding: task 1 of 2, 10.00 %\n[error] Could not open the source\nMuxing: 50 %')
+    check(notes == ['[error] Could not open the source'], 'a fault report keeps the HandBrake error and drops the percent lines')
+    fault = {
+        'when': '2026-11-11T16:42:27',
+        'kind': 'check',
+        'source': '/mnt/unified-media/Movies/The Stingiest Man in Town (1978).mp4',
+        'name': 'The Stingiest Man in Town (1978).mp4',
+        'reason': 'duration changed from 2993.8s to 2985.6s',
+        'size_bytes': 427543074,
+        'modified': '2026-11-01T12:00:00',
+        'kbps': 500,
+        'jobs': 4,
+        'reencode_audio': False,
+        'auto_delete': True,
+        'handbrake_code': 0,
+        'command': "HandBrakeCLI -i '/mnt/unified-media/Movies/The Stingiest Man in Town (1978).mp4'",
+        'old_bytes': 427543074,
+        'new_bytes': 236000000,
+        'old_gibph': 0.479,
+        'new_gibph': 0.265,
+        'source_probe': {'video_codec': 'h264', 'width': 720, 'height': 480, 'pix_fmt': 'yuv420p', 'duration_sec': 2993.791, 'audio': ['aac'], 'subtitles': 0, 'video_bitrate': 1000000},
+        'output_probe': {'video_codec': 'hevc', 'width': 720, 'height': 480, 'pix_fmt': 'yuv420p', 'duration_sec': 2985.6, 'audio': ['aac'], 'subtitles': 0, 'video_bitrate': 500000},
+        'media': 'stream|codec_name=h264|nb_frames=89724|duration=2993.790800',
+        'log': ['Encode done'],
+    }
+    report = format_fault_report([fault], '1.0.10', 'Ubuntu 26.04')
+    check('App version: 1.0.10' in report, 'a fault report names the app version')
+    check('The Stingiest Man in Town (1978).mp4' in report and 'duration changed from 2993.8s to 2985.6s' in report, 'a fault report names the file and the failure')
+    check('nb_frames=89724' in report and 'HandBrakeCLI' in report and 'h264 720x480' in report, 'a fault report includes the probe and the command')
+    check('Original file was left in place' in report or 'original file was left in place' in report, 'a fault report says the original stayed')
+    issue = fault_issue_request([fault], '1.0.10', 'Ubuntu 26.04')
+    check(issue['url'].startswith(FAULT_ISSUE_URL + '?title='), 'a fault report opens a Linux GitHub issue')
+    check('body=' in issue['url'] and 'duration%20changed' in issue['url'], 'the issue link carries the failure')
+    fat = dict(fault)
+    fat['log'] = ['note ' + str(index) + (' x' * 80) for index in range(400)]
+    short = fault_issue_request([fat], '1.0.10', 'Ubuntu 26.04', limit=2500)
+    check(len(short['url']) <= 2500 and short['trimmed'], 'a long HandBrake log shrinks to fit the link')
+    check('duration changed from 2993.8s to 2985.6s' in short['body'], 'a shortened report still has the failure')
+    again = dict(fault)
+    again['reason'] = 'HandBrake stopped (3).'
+    merged = merge_fault([fault], again)
+    check(len(merged) == 1 and merged[0]['reason'] == 'HandBrake stopped (3).', 'a later failure replaces the same file')
+    made = make_fault_record('check', '/tmp/does-not-exist.mkv', 'duration changed from 10s to 3s', kbps=200, jobs=1)
+    check(made['kind'] == 'check' and made['reason'].startswith('duration changed') and made['name'] == 'does-not-exist.mkv', 'a fault record keeps the kind and the file name')
     ac3_tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
     check(trailing_ac3_note(ac3_tail), 'one trailing incomplete AC3 frame is the allowed note')
     same_stamp = '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10 | [null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 18 >= 18'
@@ -161,6 +214,7 @@ def test_rules():
     check(not linux_release_is_update('v1.0.8', '1.0.7.4', None), 'a Windows-only release is not a Linux update')
     check(linux_release_is_update('v1.0.8', '1.0.7.4', {'name': 'video_dehydrator_linux.tar.gz', 'url': 'https://example.com/video_dehydrator_linux.tar.gz'}), 'a Linux archive is an update')
     check(compare_versions('v1.0.9.6', '1.0.9.5') == 1, '1.0.9.6 is newer than 1.0.9.5')
+    check(compare_versions('1.0.10', '1.0.9.15') == 1, '1.0.10 is newer than 1.0.9.15')
     release = {
         'tag_name': 'v1.0.9.6',
         'assets': [{
@@ -194,7 +248,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.0.9.14', 'app version')
+    check(app_version() == '1.0.10', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -212,6 +266,7 @@ def test_rules():
     check(batch_count_text(120, 100) == '100/100', 'batch count stays within the batch')
     guide = '\n'.join(body for _title, body in SECTIONS)
     check('4/100 means this batch has started file 4 of 100' in guide, 'guide batch count')
+    check('Faulty source file stays off until a file fails' in guide, 'guide fault button')
     check('Drag a column edge to change its width' in guide, 'guide column width')
     check('each file has its own bar' in guide, 'guide per-file bars')
     check('already an efficient encode' in guide, 'guide leaves efficient files that will not shrink')

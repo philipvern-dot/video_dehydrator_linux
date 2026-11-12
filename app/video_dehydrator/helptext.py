@@ -77,6 +77,7 @@ SECTIONS = [
         'Updates',
         "The program checks the Linux releases on GitHub when it opens. Check for updates looks again. Update downloads the Linux archive, opens a terminal, and runs its installer. The program opens again when that finishes.\n\n"
         "Report a bug opens a GitHub page. This program does not send the report. You submit it on the GitHub page. Include latest activity adds the latest lines from the activity box, which can include folder paths.\n\n"
+        "Faulty source file stays off until a file fails the encode or the end check. It then turns red. A file that is only not smaller does not turn it on. Click it to open a GitHub issue with the file path, the probe, the failure, the encode command, and the HandBrake notes. You submit that issue on the GitHub page. The alert stays on until you say you submitted it.\n\n"
         "Donate opens https://ko-fi.com/philipvern. The program stays free.",
     ),
 ]

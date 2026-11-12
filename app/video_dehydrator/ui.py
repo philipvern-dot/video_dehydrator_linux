@@ -34,12 +34,14 @@ from .engine import (
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
     LINUX_DOWNLOAD_PREFIX, LINUX_RELEASES, linux_release_asset, linux_release_is_update,
     add_hold_busy_marker, apply_encode_snapshot, encoder_name, encode_row_snapshot, estimated_savings_bytes, force_convertible, force_video_paths,
+    FAULT_ISSUE_URL, fault_issue_request, format_fault_report,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
     lane_bar_text, lane_pass_name,
     is_encode_progress_line, is_video_file, larger_file_note, FIND_LIMITS,
     batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
+    make_fault_record, merge_fault,
     output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
     remembered_skip, remove_empty_directory, remove_hold_busy_marker, remove_kept_original, remove_skip_row, replace_plan,
     replace_with_encode, run_lines, scan_limit_reached, set_budget_picks, size_skip_reason,
@@ -47,8 +49,8 @@ from .engine import (
 )
 from .recycle import RecycleBook, set_purge_enabled
 from .store import (
-    append_convert_log, load_settings, read_pending, read_skips, save_settings,
-    write_pending, write_skips,
+    append_convert_log, load_settings, read_faults, read_pending, read_skips, save_settings,
+    write_faults, write_pending, write_skips,
 )
 
 COLUMNS = [
@@ -347,6 +349,16 @@ class ConvertWorker(QThread):
 
     def _post_row(self, row):
         self._post('file', encode_row_snapshot(row))
+
+    def _note_fault(self, kind, source, reason, probe=None, out_probe=None, old_bytes=0, new_bytes=0, old_gibph=None, new_gibph=None, kbps=0, command=None, handbrake_log='', handbrake_code=None):
+        record = make_fault_record(
+            kind, source, reason, probe=probe, out_probe=out_probe,
+            old_bytes=old_bytes, new_bytes=new_bytes, old_gibph=old_gibph, new_gibph=new_gibph,
+            kbps=kbps, command=command, handbrake_log=handbrake_log, handbrake_code=handbrake_code,
+            jobs=self.jobs, reencode_audio=self.reencode, auto_delete=self.delete_original,
+            ffprobe=str(self.tools.get('ffprobe') or ''),
+        )
+        self._post('fault', record)
 
     def _slot(self) -> EncodeSlot:
         slot = getattr(self._tls, 'slot', None)
@@ -719,6 +731,7 @@ class ConvertWorker(QThread):
             row['reason'] = str(exc)
             row['checked'] = True
             self._post('activity', f'Could not read {os.path.basename(source)}. {exc}', 'err')
+            self._note_fault('unreadable', source, str(exc))
             self._post_row(row)
             return
         decision = bloat_decision(probe)
@@ -813,6 +826,10 @@ class ConvertWorker(QThread):
             row['reason'] = f'HandBrake stopped ({code}).'
             append_convert_log('FAIL', row['reason'], source, '', '', probe.size_bytes, 0, 0, 0, probe.width, probe.height, kbps)
             self._post('activity', f"Failed {os.path.basename(source)}. {row['reason']}", 'err')
+            self._note_fault(
+                'encode', source, row['reason'], probe=probe, old_bytes=probe.size_bytes, kbps=kbps,
+                command=command, handbrake_log=handbrake_log, handbrake_code=code,
+            )
             self._post_row(row)
             return
         self._remember_finished()
@@ -845,6 +862,12 @@ class ConvertWorker(QThread):
                 row['reason'] = checked['reason']
                 append_convert_log('FAIL', checked['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
                 self._post('activity', f"Failed {os.path.basename(source)}. {checked['reason']}", 'err')
+                self._note_fault(
+                    'check', source, checked['reason'], probe=probe, out_probe=checked.get('out_probe'),
+                    old_bytes=probe.size_bytes, new_bytes=checked.get('new_bytes') or 0,
+                    old_gibph=checked.get('old_gibph'), new_gibph=checked.get('new_gibph'), kbps=kbps,
+                    command=command, handbrake_log=handbrake_log, handbrake_code=code,
+                )
             self._post_row(row)
             return
         try:
@@ -1049,6 +1072,18 @@ def control_style() -> str:
         border: 1px solid #cbd5e1;
         border-bottom: 3px solid #cbd5e1;
     }
+    QPushButton#faultButton:enabled {
+        background: #b91c1c;
+        color: #ffffff;
+        border: 1px solid #7f1d1d;
+        border-bottom: 3px solid #7f1d1d;
+        font-weight: 700;
+    }
+    QPushButton#faultButton:enabled:hover { background: #991b1b; }
+    QPushButton#faultButton:enabled:pressed {
+        background: #7f1d1d;
+        border-bottom: 1px solid #7f1d1d;
+    }
     ''' + indicator_style()
 
 
@@ -1081,6 +1116,7 @@ class MainWindow(QMainWindow):
         self.saved_bytes = 0
         self.update_offer = None
         self._update_started = False
+        self.faults = read_faults()
         self.show_filters = {key: False for key, _label in SHOW_FILTERS}
         self._sort_desc = {6: True, 10: True, 11: True}
         self._split_ready = False
@@ -1096,6 +1132,7 @@ class MainWindow(QMainWindow):
         else:
             self.log('Ready. Choose a folder, then click Scan.', 'text')
             self.log('Scan lists videos that are too big for their picture size. The Budgets row starts on Recommended.', 'text')
+        self._refresh_fault_button()
         self.status.setText('Ready')
 
     def _build(self):
@@ -1113,13 +1150,18 @@ class MainWindow(QMainWindow):
         self.update_button.setEnabled(False)
         self.donate = QPushButton('Donate')
         self.report = QPushButton('Report a bug')
+        self.fault_button = QPushButton('Faulty source file')
+        self.fault_button.setObjectName('faultButton')
+        self.fault_button.setEnabled(False)
         self.check_update.clicked.connect(self.check_for_updates)
         self.update_button.clicked.connect(self.install_update)
         self.donate.clicked.connect(lambda: self.open_url(KOFI))
         self.report.clicked.connect(self.report_bug)
+        self.fault_button.clicked.connect(self.show_faults)
         top = QHBoxLayout()
         top.addWidget(header)
         top.addStretch(1)
+        top.addWidget(self.fault_button)
         top.addWidget(self.check_update)
         top.addWidget(self.update_button)
         top.addWidget(self.donate)
@@ -1451,6 +1493,7 @@ class MainWindow(QMainWindow):
             self.check_update: 'Look on GitHub for a newer version.',
             self.donate: 'Free forever. Tips of $5 or more can include a feature suggestion.',
             self.report: 'Open a GitHub bug report with this version filled in.',
+            self.fault_button: 'Turns red when a file fails the encode or the end check. Click it to open a GitHub report for that file.',
             self.update_button: 'Download the newer Linux archive and install it. A terminal opens, and this window closes while that runs.',
             self.folder_pick: 'Folders with files to shrink. Pick one for a smaller job.',
             self.select_folder: 'Check the files in this folder and clear the other checks.',
@@ -1994,6 +2037,8 @@ class MainWindow(QMainWindow):
                 self._set_single_progress(payload[0])
             elif kind == 'lanes':
                 self.set_lanes(payload[0])
+            elif kind == 'fault':
+                self._add_fault(payload[0])
             elif kind == 'file':
                 self.on_file_update(payload[0])
             elif kind == 'eta':
@@ -2430,6 +2475,89 @@ class MainWindow(QMainWindow):
         write_skips(self.skips)
         self.log(f'Forgot {count} skipped files. Scan again to list them.', 'text')
 
+    def _refresh_fault_button(self):
+        count = len(self.faults or [])
+        self.fault_button.setEnabled(count > 0)
+        if count > 1:
+            self.fault_button.setText(f'Faulty source file ({count})')
+        else:
+            self.fault_button.setText('Faulty source file')
+        if count == 1:
+            self.fault_button.setToolTip('1 file failed. Click to open a GitHub report with the file and the log.')
+        elif count > 1:
+            self.fault_button.setToolTip(f'{count} files failed. Click to open a GitHub report with the files and the logs.')
+        else:
+            self.fault_button.setToolTip('Turns red when a file fails the encode or the end check.')
+
+    def _add_fault(self, record):
+        if not isinstance(record, dict) or not record.get('source'):
+            return
+        self.faults = merge_fault(self.faults, record)
+        write_faults(self.faults)
+        self._refresh_fault_button()
+        name = record.get('name') or 'file'
+        self.log(f'Faulty source file: {name}. The red button can open a GitHub report.', 'err')
+
+    def show_faults(self):
+        records = [row for row in (self.faults or []) if isinstance(row, dict) and row.get('source')]
+        if not records:
+            self._refresh_fault_button()
+            return
+        full = format_fault_report(records, app_version(), os_label())
+        issue = fault_issue_request(records, app_version(), os_label())
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Faulty source file')
+        dialog.resize(640, 420)
+        layout = QVBoxLayout(dialog)
+        count = len(records)
+        word = 'file' if count == 1 else 'files'
+        layout.addWidget(QLabel(
+            f'{count} {word} failed the encode or the end check. The original stayed in place.\n\n'
+            'Open GitHub report fills in a new issue with the path, the probe, the failure, the encode command, and the HandBrake notes. '
+            'You submit it on the GitHub page. This program does not send it. The same report is copied, in case the page cuts it off.'
+        ))
+        listing = QPlainTextEdit()
+        listing.setReadOnly(True)
+        lines = []
+        for record in records:
+            reason = str(record.get('reason') or '')
+            if len(reason) > 180:
+                reason = reason[:180] + '...'
+            lines.append(f"{record.get('name') or 'file'}\n{reason}")
+        listing.setPlainText('\n\n'.join(lines))
+        layout.addWidget(listing, 1)
+        if issue.get('trimmed'):
+            layout.addWidget(QLabel('The HandBrake notes in the link are shortened. The copy has the full notes.'))
+        buttons = QHBoxLayout()
+        open_button = QPushButton('Open GitHub report')
+        cancel = QPushButton('Not now')
+        buttons.addStretch(1)
+        buttons.addWidget(open_button)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        go = {'open': False}
+        def accept():
+            go['open'] = True
+            dialog.accept()
+        open_button.clicked.connect(accept)
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+        if not go['open']:
+            return
+        QApplication.clipboard().setText(full)
+        self.open_url(issue['url'])
+        answer = QMessageBox.question(
+            self,
+            'Faulty source file',
+            'The GitHub page is open and the report is on the clipboard.\n\nTurn the alert off after you submit the issue?',
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.faults = []
+        write_faults(self.faults)
+        self._refresh_fault_button()
+        self.log('Fault report opened. The alert is off.', 'text')
+
     def report_bug(self):
         dialog = QDialog(self)
         dialog.setWindowTitle('Video Dehydrator')
@@ -2466,7 +2594,7 @@ class MainWindow(QMainWindow):
         self.open_url(url)
 
     def open_url(self, url):
-        allowed = url == KOFI or url.startswith(ISSUE_URL)
+        allowed = url == KOFI or url.startswith(ISSUE_URL) or url.startswith(FAULT_ISSUE_URL)
         if not allowed:
             return
         webbrowser.open(url)

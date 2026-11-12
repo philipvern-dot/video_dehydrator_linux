@@ -6,10 +6,13 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 
 REFERENCE_PIXELS = float(1920 * 1080)
@@ -543,6 +546,247 @@ def is_encode_progress_line(line: str) -> bool:
     if re.search(r'Muxing:\s*\d+', text):
         return True
     return False
+
+
+FAULT_ISSUE_URL = 'https://github.com/philipvern-dot/video_dehydrator_linux/issues/new'
+FAULT_URL_LIMIT = 7000
+
+
+def useful_handbrake_lines(log: str, limit: int = 80) -> list:
+    notes = []
+    progress = []
+    for raw in str(log or '').splitlines():
+        text = raw.strip()
+        if not text:
+            continue
+        if len(text) > 400:
+            text = text[:400] + '...'
+        if is_encode_progress_line(text):
+            progress.append(text)
+            continue
+        notes.append(text)
+    if not notes:
+        notes = progress[-15:]
+    if len(notes) > limit:
+        notes = notes[-limit:]
+    return notes
+
+
+def probe_facts(probe) -> dict:
+    if probe is None:
+        return {}
+    return {
+        'duration_sec': round(float(getattr(probe, 'duration_sec', 0) or 0), 3),
+        'size_bytes': int(getattr(probe, 'size_bytes', 0) or 0),
+        'video_codec': getattr(probe, 'video_codec', '') or '',
+        'width': int(getattr(probe, 'width', 0) or 0),
+        'height': int(getattr(probe, 'height', 0) or 0),
+        'pix_fmt': getattr(probe, 'pix_fmt', '') or '',
+        'ten_bit': bool(getattr(probe, 'is_10bit', False)),
+        'interlaced': bool(getattr(probe, 'is_interlaced', False)),
+        'audio': list(getattr(probe, 'audio_codecs', None) or []),
+        'audio_count': int(getattr(probe, 'audio_count', 0) or 0),
+        'subtitles': int(getattr(probe, 'sub_count', 0) or 0),
+        'video_bitrate': int(getattr(probe, 'video_bitrate', 0) or 0),
+    }
+
+
+def source_media_text(ffprobe: str, file_path: str) -> str:
+    """Compact ffprobe text for a fault report. Empty when the file cannot be read."""
+    if not ffprobe or not file_path or not os.path.isfile(file_path):
+        return ''
+    try:
+        code, out, err = run_captured([
+            ffprobe, '-v', 'error',
+            '-show_entries',
+            'format=format_name,duration,size,bit_rate:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,field_order,r_frame_rate,avg_frame_rate,nb_frames,duration,channels,channel_layout,sample_rate,bit_rate',
+            '-of', 'compact',
+            '--', file_path,
+        ])
+    except OSError as exc:
+        return str(exc)
+    text = (out or '').strip() or (err or '').strip()
+    if code not in (0, None) and not text:
+        return f'ffprobe exited {code}'
+    if len(text) > 4000:
+        text = text[:4000] + '\n...'
+    return text
+
+
+def _file_modified(path: str) -> str:
+    try:
+        moment = datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return ''
+    return moment.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def make_fault_record(kind, source, reason, probe=None, out_probe=None, old_bytes=0, new_bytes=0, old_gibph=None, new_gibph=None, kbps=0, command=None, handbrake_log='', handbrake_code=None, jobs=0, reencode_audio=False, auto_delete=False, ffprobe='') -> dict:
+    """Plain details for one file the encode or the end check rejected."""
+    facts = probe_facts(probe)
+    try:
+        size = os.path.getsize(source) if source and os.path.isfile(source) else int(facts.get('size_bytes') or 0)
+    except OSError:
+        size = int(facts.get('size_bytes') or 0)
+    command_text = ' '.join(shlex.quote(str(part)) for part in (command or []))
+    return {
+        'when': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+        'kind': kind or 'check',
+        'source': source or '',
+        'name': os.path.basename(source or '') or 'file',
+        'reason': ' '.join(str(reason or '').split()),
+        'size_bytes': int(size or 0),
+        'modified': _file_modified(source) if source else '',
+        'kbps': int(kbps or 0),
+        'jobs': int(jobs or 0),
+        'reencode_audio': bool(reencode_audio),
+        'auto_delete': bool(auto_delete),
+        'handbrake_code': handbrake_code,
+        'command': command_text,
+        'old_bytes': int(old_bytes or 0),
+        'new_bytes': int(new_bytes or 0),
+        'old_gibph': old_gibph,
+        'new_gibph': new_gibph,
+        'source_probe': facts,
+        'output_probe': probe_facts(out_probe),
+        'media': source_media_text(ffprobe, source) if ffprobe else '',
+        'log': useful_handbrake_lines(handbrake_log),
+    }
+
+
+def merge_fault(rows, record) -> list:
+    source = str((record or {}).get('source') or '')
+    if not source:
+        return [row for row in (rows or []) if isinstance(row, dict)]
+    kept = [row for row in (rows or []) if isinstance(row, dict) and str(row.get('source') or '') != source]
+    kept.append(record)
+    if len(kept) > 30:
+        kept = kept[-30:]
+    return kept
+
+
+def _rate_text(value) -> str:
+    if value is None or value == '':
+        return ''
+    try:
+        return f'{float(value):.3f}'
+    except (TypeError, ValueError):
+        return ''
+
+
+def _probe_line(label: str, facts: dict) -> str:
+    if not facts:
+        return ''
+    audio = ','.join(facts.get('audio') or []) or 'none'
+    return (
+        f"{label}: {facts.get('video_codec') or '?'} "
+        f"{facts.get('width') or 0}x{facts.get('height') or 0} "
+        f"pix {facts.get('pix_fmt') or '?'} "
+        f"duration {facts.get('duration_sec') or 0}s "
+        f"audio {audio} "
+        f"subtitles {facts.get('subtitles') or 0} "
+        f"bitrate {facts.get('video_bitrate') or 0}"
+    )
+
+
+def format_fault_report(records, version: str, system: str) -> str:
+    lines = [
+        'Video Dehydrator found a file it could not finish.',
+        '',
+        f'App version: {version}',
+        f'System: {system}',
+        'The original file was left in place. The new file was not kept.',
+        'This report is an encode failure or an end-check failure. A file that was only not smaller is not listed.',
+        '',
+    ]
+    for record in records or []:
+        name = record.get('name') or os.path.basename(str(record.get('source') or '')) or 'file'
+        lines.append(f'## {name}')
+        lines.append(f"When: {record.get('when') or ''}")
+        lines.append(f"Kind: {record.get('kind') or ''}")
+        lines.append(f"Path: {record.get('source') or ''}")
+        lines.append(f"Size: {record.get('size_bytes') or 0} bytes")
+        if record.get('modified'):
+            lines.append(f"Modified: {record.get('modified')}")
+        lines.append(f"Target: {record.get('kbps') or 0} kbps")
+        lines.append(f"Parallel jobs: {record.get('jobs') or ''}")
+        lines.append(f"Re-encode audio: {'yes' if record.get('reencode_audio') else 'no'}")
+        lines.append(f"Delete originals: {'yes' if record.get('auto_delete') else 'no'}")
+        code = record.get('handbrake_code')
+        lines.append(f"HandBrake exit: {'' if code is None else code}")
+        lines.append(f"Old size: {record.get('old_bytes') or 0} bytes")
+        lines.append(f"New size: {record.get('new_bytes') or 0} bytes")
+        old_rate = _rate_text(record.get('old_gibph'))
+        new_rate = _rate_text(record.get('new_gibph'))
+        if old_rate:
+            lines.append(f'Old GiB/h: {old_rate}')
+        if new_rate:
+            lines.append(f'New GiB/h: {new_rate}')
+        lines.append('Reason: ' + str(record.get('reason') or ''))
+        source_line = _probe_line('Source probe', record.get('source_probe') or {})
+        output_line = _probe_line('Output probe', record.get('output_probe') or {})
+        if source_line:
+            lines.append(source_line)
+        if output_line:
+            lines.append(output_line)
+        if record.get('command'):
+            lines.append('Command: ' + str(record.get('command')))
+        media = str(record.get('media') or '').strip()
+        if media:
+            lines.append('ffprobe:')
+            lines.append(media)
+        notes = [str(line) for line in (record.get('log') or []) if str(line).strip()]
+        if notes:
+            lines.append('HandBrake notes:')
+            lines.extend(notes)
+        lines.append('')
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def _fault_url(title: str, body: str) -> str:
+    return FAULT_ISSUE_URL + '?title=' + quote(title) + '&body=' + quote(body)
+
+
+def _shrink_fault_report(records) -> bool:
+    for row in records:
+        log = list(row.get('log') or [])
+        if len(log) > 4:
+            row['log'] = log[len(log) // 2:]
+            return True
+    for row in records:
+        if row.get('log'):
+            row['log'] = []
+            return True
+    for row in records:
+        media = str(row.get('media') or '')
+        if len(media) > 400:
+            row['media'] = media[:max(200, len(media) // 2)]
+            return True
+    for row in records:
+        if row.get('media'):
+            row['media'] = ''
+            return True
+    return False
+
+
+def fault_issue_request(records, version: str, system: str, limit: int = FAULT_URL_LIMIT) -> dict:
+    """One GitHub issue link. The body keeps the reason and shrinks the log to fit a browser."""
+    names = [str(row.get('name') or 'file') for row in (records or [])]
+    if len(names) == 1:
+        title = 'Faulty source file: ' + names[0]
+    elif names:
+        title = f'Faulty source files ({len(names)})'
+    else:
+        title = 'Faulty source file'
+    working = [dict(row) for row in (records or [])]
+    body = format_fault_report(working, version, system)
+    url = _fault_url(title, body)
+    trimmed = False
+    while len(url) > limit and _shrink_fault_report(working):
+        trimmed = True
+        body = format_fault_report(working, version, system).rstrip() + '\n\nHandBrake notes were shortened so this link would open.\n'
+        url = _fault_url(title, body)
+    return {'title': title, 'body': body, 'url': url, 'trimmed': trimmed}
 
 
 def _positive_int(text) -> int:
@@ -1287,6 +1531,23 @@ def mp3_new_backstep_line(text: str) -> bool:
     ))
 
 
+def aac_sbr_factor_line(text: str) -> bool:
+    """FFmpeg logs this when a seek lands in copied HE-AAC, then keeps decoding."""
+    if text is None or not str(text).strip():
+        return False
+    return bool(re.match(
+        r'^(?:\[[^\]]+\]\s*)*(?:noise_facs_q|env_facs_q) \d+ is invalid\s*$',
+        str(text).strip(),
+    ))
+
+
+def repeated_message_line(text: str) -> bool:
+    """FFmpeg folds a run of the same note into this line."""
+    if text is None or not str(text).strip():
+        return False
+    return bool(re.match(r'^Last message repeated \d+ times?\s*$', str(text).strip()))
+
+
 def harmless_decode_note(text: str) -> bool:
     if text is None or not str(text).strip():
         return True
@@ -1294,7 +1555,12 @@ def harmless_decode_note(text: str) -> bool:
     if not lines:
         return True
     for line in lines:
-        if equal_timestamp_line(line) or mp3_new_backstep_line(line):
+        if (
+            equal_timestamp_line(line)
+            or mp3_new_backstep_line(line)
+            or aac_sbr_factor_line(line)
+            or repeated_message_line(line)
+        ):
             continue
         return False
     return True
@@ -1313,8 +1579,9 @@ def decode_window(ffmpeg: str, file_path: str, duration_sec: float, window: str)
     code, out, err = run_captured(args)
     detail = ' | '.join(part for part in re.split(r'\r?\n', (out + '\n' + err)) if part and part.strip())
     # -xerror can turn a recovered decoder note into a non-zero exit.
-    # Equal timestamps and an MP3 backstep warning are recovered notes.
-    # A blank failure is still a failure.
+    # Equal timestamps, an MP3 backstep warning, and an HE-AAC factor
+    # warning from a seek are recovered notes. A blank failure is still
+    # a failure.
     if harmless_decode_note(detail) and str(detail).strip():
         return {'ok': True, 'detail': ''}
     if code != 0 or not harmless_decode_note(detail):

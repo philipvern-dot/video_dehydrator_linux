@@ -1,10 +1,16 @@
 # Video Dehydrator for Linux
 
-This is the Linux copy of Video Dehydrator 1.0.9.14. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
+This is the Linux copy of Video Dehydrator 1.0.10. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
 
-The picture rules match Windows 1.0.9.5: the same x265 medium two-pass rates, the same audio copy, and the same checks. A file made on this computer will not be byte-for-byte the same as a file made on the Windows PC. The target rate is the same, so the size and the kind of picture stay the same.
+The picture rules match Windows 1.0.10: the same x265 medium two-pass rates and the same audio copy. A file made on this computer will not be byte-for-byte the same as a file made on the Windows PC. The target rate is the same, so the size and the kind of picture stay the same.
 
 The Windows program stays in the `windows` folder. This copy does not change it.
+
+## What's new in 1.0.10
+
+The check at the end of a file keeps a good encode when the only extra notes are HE-AAC `noise_facs_q` or `env_facs_q` warnings, including FFmpeg's "Last message repeated" line. FFmpeg prints those when it seeks into copied HE-AAC, then keeps decoding. Paranoia Agent was one of these: the new file was smaller, the picture matched, and those warnings were the only notes. A straight decode of the same ending is clean. Another AAC error, or a picture error, still fails the file.
+
+Faulty source file stays off until a file fails the encode or the end check. It then turns red. Click it to open a GitHub issue on video_dehydrator_linux with the path, the probe, the failure, the encode command, and the HandBrake notes. You submit the issue on the GitHub page. A file that is only not smaller does not turn the button on.
 
 ## What's new in 1.0.9.14
 
