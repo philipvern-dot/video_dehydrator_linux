@@ -301,16 +301,15 @@ class EncodeSlot:
         self.name = ''
 
 
-class ConvertWorker(QThread):
+class ConvertWorker(threading.Thread):
     """Encode files off the window thread.
 
-    Progress is posted on a queue. The window applies it. These threads do not
-    call Qt. A direct signal from a pool thread was crashing the interpreter
-    during long batches.
+    Progress is posted on a queue. The window applies it. This is a normal
+    Python thread. A Qt thread crashed the interpreter during long batches.
     """
 
     def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1):
-        super().__init__()
+        super().__init__(name='vd-convert', daemon=True)
         self.rows = [encode_row_snapshot(row) for row in rows]
         self.events = queue.Queue()
         self.tools = tools

@@ -1,10 +1,14 @@
 # Video Dehydrator for Linux
 
-This is the Linux copy of Video Dehydrator 1.0.10. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
+This is the Linux copy of Video Dehydrator 1.1.0. It does the same jobs as the Windows program: scan a folder, shrink videos that are too big for their picture size, check the new file, and keep or delete the original. The window is a normal desktop window. It runs on Ubuntu and on other desktops that can show a Qt window.
 
 The picture rules match Windows 1.0.10: the same x265 medium two-pass rates and the same audio copy. A file made on this computer will not be byte-for-byte the same as a file made on the Windows PC. The target rate is the same, so the size and the kind of picture stay the same.
 
 The Windows program stays in the `windows` folder. This copy does not change it.
+
+## What's new in 1.1.0
+
+Optimize runs on a normal Python thread. The encoder was a Qt thread, and a long batch stopped with an Ubuntu internal error. Progress still arrives on the window through the same queue.
 
 ## What's new in 1.0.10
 
