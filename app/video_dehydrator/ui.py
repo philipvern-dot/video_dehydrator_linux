@@ -40,6 +40,7 @@ from .engine import (
     lane_bar_text, lane_pass_name,
     is_encode_progress_line, is_video_file, larger_file_note, FIND_LIMITS,
     batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
+    CPU_TARGETS, EncodeAdmission, cpu_target_percent, dynamic_lane_count, processor_layout, split_core_budget, target_core_budget,
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
     make_fault_record, merge_fault,
     output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
@@ -308,7 +309,7 @@ class ConvertWorker(threading.Thread):
     Python thread. A Qt thread crashed the interpreter during long batches.
     """
 
-    def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1):
+    def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1, dynamic=False, cpu_target=100, node_cores=None):
         super().__init__(name='vd-convert', daemon=True)
         self.rows = [encode_row_snapshot(row) for row in rows]
         self.events = queue.Queue()
@@ -320,6 +321,13 @@ class ConvertWorker(threading.Thread):
         self.cancel = cancel
         self.force = force
         self.jobs = job_count(jobs)
+        self.dynamic = bool(dynamic)
+        self.cpu_target = cpu_target_percent(cpu_target)
+        self._admission = None
+        if self.dynamic:
+            layout = list(node_cores) if node_cores else processor_layout()
+            budget = target_core_budget(sum(layout), self.cpu_target)
+            self._admission = EncodeAdmission(split_core_budget(layout, budget))
         self.stop_after = threading.Event()
         self.book = RecycleBook()
         self.batch = uuid.uuid4().hex
@@ -578,7 +586,7 @@ class ConvertWorker(threading.Thread):
                 parts = [f'{item[0]}: {item[1].replace("This file: ", "")}' for item in self._file_eta.values()]
             queued = self._queued_seconds(rate8, rate10)
             have_batch = queued is not None and all(item > 0 for item in running)
-            wall = batch_wall_seconds(running, queued or 0, self.jobs) if have_batch else 0
+            wall = batch_wall_seconds(running, queued or 0, self._share_lanes()) if have_batch else 0
             batch_text = format_remaining_time(wall) if have_batch else 'estimating'
             text = f"{' '.join(parts)}. Estimated time remaining: {batch_text}"
         since = 999.0 if slot.shown_at is None else time.monotonic() - slot.shown_at
@@ -599,6 +607,15 @@ class ConvertWorker(threading.Thread):
                 if solo and estimate.get('have_batch') and batch_seconds > 0:
                     self._window_add(slot.batch_samples, batch_seconds)
 
+    def _share_lanes(self) -> int:
+        if not self.dynamic:
+            return max(1, self.jobs)
+        with self._state:
+            running = self._active
+        if running < 1:
+            running = self.jobs
+        return max(1, running)
+
     def _take_row(self):
         while True:
             if self.cancel.is_set():
@@ -611,10 +628,25 @@ class ConvertWorker(threading.Thread):
                     if self._active == 0:
                         return None
                 elif self._queue:
-                    self._active += 1
-                    self.file_index += 1
-                    started = self.file_index
-                    taken = self._queue.pop(0)
+                    if self._admission is None:
+                        self._active += 1
+                        self.file_index += 1
+                        started = self.file_index
+                        taken = self._queue.pop(0)
+                    else:
+                        head = self._queue[0]
+                        key = id(head)
+                        node = self._admission.try_admit(key, self._admission.threads_for(head.get('width'), head.get('height')))
+                        if node is not None:
+                            self._queue.pop(0)
+                            self._active += 1
+                            self.file_index += 1
+                            started = self.file_index
+                            taken = head
+                            _node, threads = self._admission.running[key]
+                            self._tls.pool = threads
+                            self._tls.node = node
+                            self._tls.admit_key = key
                 elif self._active == 0:
                     return None
             if taken is not None:
@@ -624,11 +656,15 @@ class ConvertWorker(threading.Thread):
             self._resume.clear()
 
     def _finish_active(self):
+        key = getattr(self._tls, 'admit_key', None)
         with self._state:
+            if self._admission is not None and key is not None:
+                self._admission.release(key)
             self._active = max(0, self._active - 1)
             self._finished += 1
             self._running_percents.pop(id(self._slot()), None)
             self._file_eta.pop(id(self._slot()), None)
+        self._tls.admit_key = None
         self._resume.set()
 
     def run(self):
@@ -649,11 +685,14 @@ class ConvertWorker(threading.Thread):
         })
 
     def _run_lanes(self):
-        lanes = job_count(self.jobs)
-        if len(self.rows) <= 1:
-            lanes = 1
-        elif lanes > len(self.rows):
-            lanes = len(self.rows)
+        if self.dynamic:
+            lanes = dynamic_lane_count(len(self.rows), sum(self._admission.capacity))
+        else:
+            lanes = job_count(self.jobs)
+            if len(self.rows) <= 1:
+                lanes = 1
+            elif lanes > len(self.rows):
+                lanes = len(self.rows)
         self.jobs = lanes
         with self._state:
             self.file_index = 0
@@ -663,7 +702,9 @@ class ConvertWorker(threading.Thread):
             self._stopped = False
             self._running_percents = {}
             self._file_eta = {}
-        if lanes > 1:
+        if self.dynamic:
+            self._post('activity', f'Dynamic encode batch jobs is on at {self.cpu_target}% CPU use. Small pictures use 3 threads, 720p uses 4, and 1080p or larger uses 8.', 'text')
+        elif lanes > 1:
             self._post('activity', f'Parallel jobs is {lanes}. Up to {lanes} files encode at the same time.', 'text')
 
         def work(node):
@@ -677,12 +718,14 @@ class ConvertWorker(threading.Thread):
                     row = self._take_row()
                     if row is None:
                         return
+                    requeued = False
                     try:
-                        self.convert_row(row)
+                        requeued = self.convert_row(row) == 'requeue'
                     finally:
                         slot.name = ''
                         slot.checking = False
-                        self._finish_active()
+                        if not requeued:
+                            self._finish_active()
                         self._set_progress(0, force=True)
             finally:
                 with self._state:
@@ -699,6 +742,38 @@ class ConvertWorker(threading.Thread):
             for thread in threads:
                 thread.join()
 
+    def _pool_size(self) -> int:
+        if self.dynamic:
+            return int(getattr(self._tls, 'pool', 0) or 0)
+        return 8 if self.jobs >= 2 else 0
+
+    def _start_line(self, verb, name) -> str:
+        if not self.dynamic:
+            return f'{verb} {name}.'
+        return f'{verb} {name}. {self._pool_size()} threads.'
+
+    def _settle_pool(self, row, probe):
+        if self._admission is None:
+            return None
+        need = self._admission.threads_for(probe.width, probe.height)
+        key = getattr(self._tls, 'admit_key', None)
+        if need == int(getattr(self._tls, 'pool', 0) or 0):
+            return None
+        with self._state:
+            node = self._admission.resize(key, need)
+            if node is None:
+                self._queue.insert(0, row)
+                self._active = max(0, self._active - 1)
+                self.file_index = max(0, self.file_index - 1)
+                self._tls.admit_key = None
+                self._resume.set()
+                return 'requeue'
+            _node, threads = self._admission.running[key]
+            self._tls.pool = threads
+            self._tls.node = node
+        self._resume.set()
+        return None
+
     def _restore_status(self, row, previous):
         if previous in ('Failed', 'Skipped', 'Can shrink', 'Forced'):
             row['status'] = previous
@@ -712,13 +787,9 @@ class ConvertWorker(threading.Thread):
         verb = 'Forcing' if self.force else 'Converting'
         slot = self._slot()
         slot.name = os.path.basename(source)
-        self._post('activity', f"{verb} {slot.name}.", 'text')
-        row['status'] = 'Converting'
-        self._post_row(row)
         self._reset_clock()
         slot.name = os.path.basename(source)
         self._set_progress(0)
-        self._emit_eta()
         if self.cancel.is_set():
             self._restore_status(row, previous)
             self._post_row(row)
@@ -733,6 +804,12 @@ class ConvertWorker(threading.Thread):
             self._note_fault('unreadable', source, str(exc))
             self._post_row(row)
             return
+        if self._settle_pool(row, probe) == 'requeue':
+            return 'requeue'
+        self._post('activity', self._start_line(verb, slot.name), 'text')
+        row['status'] = 'Converting'
+        self._post_row(row)
+        self._emit_eta()
         decision = bloat_decision(probe)
         if self.force and not force_convertible(decision):
             row['status'] = 'Left alone'
@@ -759,7 +836,7 @@ class ConvertWorker(threading.Thread):
         os.makedirs(plan['hold_dir'], exist_ok=True)
         encoder = encoder_name(probe)
         kbps = target_kbps(probe.width, probe.height)
-        pool = 8 if self.jobs >= 2 else 0
+        pool = self._pool_size()
         output_retries = 0
         single_pass = False
         handbrake_log = ''
@@ -1347,6 +1424,33 @@ class MainWindow(QMainWindow):
         jobs_label = QLabel('Parallel jobs')
         jobs_label.setToolTip(jobs_tip)
         self.jobs_box.setToolTip(jobs_tip)
+        self.dynamic_jobs = QCheckBox('Dynamic encode batch jobs')
+        dynamic_tip = (
+            'Size each encode from the picture, and run as many files as fit.\n\n'
+            'A small picture uses 3 threads, 720p uses 4, and 1080p or larger uses 8.\n'
+            'CPU use is how much of this computer those threads may fill.\n'
+            '100% still leaves one or two cores free so the system can keep running.\n\n'
+            'Parallel jobs is not used while this is on. Leave it off on a laptop that should stay at one file.'
+        )
+        self.dynamic_jobs.setToolTip(dynamic_tip)
+        self.dynamic_jobs.setChecked(bool(self.settings.get('dynamicJobs')))
+        self.dynamic_jobs.stateChanged.connect(self._dynamic_changed)
+        self.cpu_use = QComboBox()
+        for percent in CPU_TARGETS:
+            self.cpu_use.addItem(f'{percent}%', percent)
+        saved_cpu = cpu_target_percent(self.settings.get('cpuTarget') or 100)
+        cpu_index = self.cpu_use.findData(saved_cpu)
+        self.cpu_use.setCurrentIndex(cpu_index if cpu_index >= 0 else self.cpu_use.count() - 1)
+        self.cpu_use.currentIndexChanged.connect(self.persist)
+        cpu_tip = (
+            'How much of this computer Dynamic encode batch jobs may use.\n\n'
+            '25%, 50%, 75%, and 95% are shares of the safe amount.\n'
+            '100% is that safe amount. It still leaves one or two cores free.'
+        )
+        self.cpu_use.setToolTip(cpu_tip)
+        cpu_label = QLabel('CPU use')
+        cpu_label.setToolTip(cpu_tip)
+        self.cpu_label = cpu_label
         self.find_box = QComboBox()
         self.find_box.addItem('All', 0)
         for count in FIND_LIMITS:
@@ -1364,6 +1468,9 @@ class MainWindow(QMainWindow):
         self.find_box.setToolTip(find_tip)
         batch.addWidget(jobs_label)
         batch.addWidget(self.jobs_box)
+        batch.addWidget(self.dynamic_jobs)
+        batch.addWidget(cpu_label)
+        batch.addWidget(self.cpu_use)
         batch.addWidget(find_label)
         batch.addWidget(self.find_box)
         batch_wrap = QWidget()
@@ -1405,22 +1512,7 @@ class MainWindow(QMainWindow):
         job_layout.setContentsMargins(0, 4, 0, 4)
         job_layout.setSpacing(6)
         for _index in range(6):
-            row = QWidget()
-            row_layout = QVBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(2)
-            label = QLabel('')
-            label.setMinimumWidth(0)
-            bar = QProgressBar()
-            bar.setRange(0, 100)
-            bar.setValue(0)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(8)
-            row_layout.addWidget(label)
-            row_layout.addWidget(bar)
-            row.setVisible(False)
-            job_layout.addWidget(row)
-            self.job_bars.append((row, label, bar))
+            self._add_job_bar()
         self.job_host.setVisible(False)
         root.addWidget(self.job_host)
         bottom = QHBoxLayout()
@@ -1445,6 +1537,10 @@ class MainWindow(QMainWindow):
             bar = self.activity.verticalScrollBar()
             bar.setValue(bar.maximum())
 
+    def _dynamic_changed(self):
+        self._refresh()
+        self.persist()
+
     def persist(self):
         if self.loading:
             return
@@ -1458,6 +1554,8 @@ class MainWindow(QMainWindow):
             'budgets': budget_pick_pack(),
             'purgeRecycle': self.recycle.isChecked(),
             'jobs': job_count(self.jobs_box.currentData()),
+            'dynamicJobs': self.dynamic_jobs.isChecked(),
+            'cpuTarget': cpu_target_percent(self.cpu_use.currentData()),
             'findLimit': int(self.find_box.currentData() or 0),
             'listExtra': int(self.settings.get('listExtra') or 0),
             'columnOrder': self._column_names(),
@@ -1904,6 +2002,8 @@ class MainWindow(QMainWindow):
             chosen, self.tools, self.reencode.isChecked(), self.auto.isChecked(),
             self.detailed.isChecked(), self.skips, self.cancel, force=force,
             jobs=job_count(self.jobs_box.currentData()),
+            dynamic=self.dynamic_jobs.isChecked(),
+            cpu_target=cpu_target_percent(self.cpu_use.currentData()),
         )
         self.worker.start()
         self._convert_timer.start()
@@ -1919,10 +2019,30 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setValue(max(0, min(100, int(value))))
 
+    def _add_job_bar(self):
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(2)
+        label = QLabel('')
+        label.setMinimumWidth(0)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(8)
+        row_layout.addWidget(label)
+        row_layout.addWidget(bar)
+        row.setVisible(False)
+        self.job_host.layout().addWidget(row)
+        self.job_bars.append((row, label, bar))
+
     def set_lanes(self, rows):
         if self.work != 'encode':
             rows = []
         rows = list(rows or [])
+        while len(self.job_bars) < len(rows):
+            self._add_job_bar()
         multi = len(rows) > 1
         self.job_host.setVisible(multi)
         self.progress.setVisible(not multi)
@@ -3016,7 +3136,9 @@ class MainWindow(QMainWindow):
         selected_ready = bool(selected and selected.get('status') == 'Ready to delete' and selected.get('kept'))
         checked_ready = any(row['checked'] and row['status'] == 'Ready to delete' and row.get('kept') for row in self.rows)
         self.delete_button.setEnabled((not busy) and (checked_ready or selected_ready))
-        self.jobs_box.setEnabled(not busy)
+        self.jobs_box.setEnabled((not busy) and not self.dynamic_jobs.isChecked())
+        self.dynamic_jobs.setEnabled(not busy)
+        self.cpu_use.setEnabled((not busy) and self.dynamic_jobs.isChecked())
         self.find_box.setEnabled(not busy)
         self.compare_button.setEnabled(not busy)
         self.undo_button.setEnabled((not busy) and any(os.path.isfile(str(item.get('kept') or '')) for item in self.pending))

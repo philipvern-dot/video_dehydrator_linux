@@ -1237,6 +1237,261 @@ def job_count(value) -> int:
     return number
 
 
+CPU_TARGETS = (25, 50, 75, 95, 100)
+
+
+def cpu_target_percent(value) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 100
+    if number in CPU_TARGETS:
+        return number
+    return 100
+
+
+def encoder_threads(width, height, node_cap) -> int:
+    """x265 pool for one picture. Zero or missing size stays at 8, then the node cap."""
+    try:
+        pixels = int(width) * int(height)
+    except (TypeError, ValueError):
+        pixels = 0
+    if pixels < 0:
+        pixels = 0
+    if pixels <= 0 or pixels >= 1_500_000:
+        want = 8
+    elif pixels < 600_000:
+        want = 3
+    else:
+        want = 4
+    try:
+        cap = int(node_cap)
+    except (TypeError, ValueError):
+        cap = 1
+    if cap < 1:
+        cap = 1
+    if want > cap:
+        want = cap
+    if want < 1:
+        want = 1
+    return want
+
+
+def system_reserve(core_count) -> int:
+    """Cores left idle even at 100%, so the desktop and the system still have a processor."""
+    try:
+        cores = int(core_count)
+    except (TypeError, ValueError):
+        cores = 1
+    if cores <= 1:
+        return 0
+    if cores < 8:
+        return 1
+    return 2
+
+
+def safe_core_budget(core_count) -> int:
+    try:
+        cores = int(core_count)
+    except (TypeError, ValueError):
+        cores = 1
+    if cores < 1:
+        cores = 1
+    safe = cores - system_reserve(cores)
+    if safe < 1:
+        safe = 1
+    return safe
+
+
+def target_core_budget(core_count, percent) -> int:
+    """How many cores a dynamic batch may use. 100% is the safe budget, not every core."""
+    safe = safe_core_budget(core_count)
+    pct = cpu_target_percent(percent)
+    if pct >= 100:
+        budget = safe
+    else:
+        budget = (safe * pct) // 100
+    if budget < 1:
+        budget = 1
+    if budget > safe:
+        budget = safe
+    return budget
+
+
+def split_core_budget(node_cores, budget) -> list:
+    """Share a core budget across NUMA nodes without passing a node's real core count."""
+    caps = []
+    for item in node_cores or []:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            number = 1
+        if number < 1:
+            number = 1
+        caps.append(number)
+    if not caps:
+        caps = [1]
+    try:
+        left = int(budget)
+    except (TypeError, ValueError):
+        left = 1
+    if left < 1:
+        left = 1
+    out = [0] * len(caps)
+    while left > 0:
+        progressed = False
+        for index, cap in enumerate(caps):
+            if left <= 0:
+                break
+            if out[index] < cap:
+                out[index] += 1
+                left -= 1
+                progressed = True
+        if not progressed:
+            break
+    if sum(out) < 1:
+        out[0] = 1
+    return out
+
+
+def dynamic_lane_count(file_count, budget) -> int:
+    try:
+        files = int(file_count)
+    except (TypeError, ValueError):
+        files = 0
+    if files <= 1:
+        return 1
+    try:
+        cores = int(budget)
+    except (TypeError, ValueError):
+        cores = 1
+    if cores < 1:
+        cores = 1
+    lanes = cores // 3
+    if lanes < 1:
+        lanes = 1
+    if lanes > files:
+        lanes = files
+    return lanes
+
+
+def _cpu_indexes(text: str):
+    indexes = []
+    for part in (text or '').split(','):
+        piece = part.strip()
+        if not piece:
+            continue
+        if '-' in piece:
+            start, end = piece.split('-', 1)
+            indexes.extend(range(int(start), int(end) + 1))
+        else:
+            indexes.append(int(piece))
+    return indexes
+
+
+def processor_layout() -> list:
+    """Physical cores on each NUMA node. One group of the logical count when the topology cannot be read."""
+    cpu_root = Path('/sys/devices/system/cpu')
+    packages = {}
+    if cpu_root.is_dir():
+        for child in cpu_root.iterdir():
+            name = child.name
+            if not name.startswith('cpu') or not name[3:].isdigit():
+                continue
+            try:
+                package = int((child / 'topology' / 'physical_package_id').read_text().strip())
+                core = int((child / 'topology' / 'core_id').read_text().strip())
+                packages[int(name[3:])] = (package, core)
+            except (OSError, ValueError):
+                continue
+    if not packages:
+        return [max(1, os.cpu_count() or 1)]
+    node_root = Path('/sys/devices/system/node')
+    nodes = {}
+    if node_root.is_dir():
+        for child in node_root.iterdir():
+            name = child.name
+            if not name.startswith('node') or not name[4:].isdigit():
+                continue
+            try:
+                listed = _cpu_indexes((child / 'cpulist').read_text())
+            except OSError:
+                continue
+            for index in listed:
+                if index in packages:
+                    nodes.setdefault(int(name[4:]), set()).add(packages[index])
+    if not nodes:
+        return [max(1, len(set(packages.values())))]
+    return [max(1, len(nodes[node_id])) for node_id in sorted(nodes)]
+
+
+class EncodeAdmission:
+    """Head-of-line core budget. A later file cannot start while the oldest one is waiting."""
+
+    def __init__(self, node_cores):
+        self.capacity = []
+        for item in node_cores or []:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                number = 1
+            if number < 1:
+                number = 1
+            self.capacity.append(number)
+        if not self.capacity:
+            self.capacity = [1]
+        self.free = list(self.capacity)
+        self.running = {}
+
+    def threads_for(self, width, height) -> int:
+        return encoder_threads(width, height, max(self.capacity))
+
+    def _need(self, threads) -> int:
+        try:
+            need = int(threads)
+        except (TypeError, ValueError):
+            need = 1
+        if need < 1:
+            need = 1
+        largest = max(self.capacity)
+        if need > largest:
+            need = largest
+        return need
+
+    def try_admit(self, key, threads):
+        if key in self.running:
+            return self.running[key][0]
+        need = self._need(threads)
+        for node, free in enumerate(self.free):
+            if free >= need and need <= self.capacity[node]:
+                self.free[node] -= need
+                self.running[key] = (node, need)
+                return node
+        return None
+
+    def release(self, key) -> None:
+        held = self.running.pop(key, None)
+        if not held:
+            return
+        node, threads = held
+        self.free[node] += threads
+
+    def resize(self, key, threads):
+        """Keep the same file. Returns the node, or None when it was released because it no longer fits."""
+        if key not in self.running:
+            return self.try_admit(key, threads)
+        node, _old = self.running[key]
+        self.release(key)
+        need = self._need(threads)
+        order = [node] + [index for index in range(len(self.free)) if index != node]
+        for index in order:
+            if self.free[index] >= need and need <= self.capacity[index]:
+                self.free[index] -= need
+                self.running[key] = (index, need)
+                return index
+        return None
+
+
 FIND_LIMITS = (5, 10, 25, 50, 100, 500, 1000)
 
 

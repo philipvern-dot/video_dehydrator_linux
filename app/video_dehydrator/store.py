@@ -23,6 +23,8 @@ DEFAULTS = {
     'purgeRecycle': False,
     'recycleAlertMuted': False,
     'jobs': 1,
+    'dynamicJobs': False,
+    'cpuTarget': 100,
     'findLimit': 0,
     'listExtra': 0,
     'columnOrder': [],
@@ -58,6 +60,13 @@ def load_settings() -> dict:
         settings['jobs'] = 1
     if settings['jobs'] > 6:
         settings['jobs'] = 6
+    settings['dynamicJobs'] = bool(settings.get('dynamicJobs'))
+    try:
+        settings['cpuTarget'] = int(settings.get('cpuTarget') or 100)
+    except (TypeError, ValueError):
+        settings['cpuTarget'] = 100
+    if settings['cpuTarget'] not in (25, 50, 75, 95, 100):
+        settings['cpuTarget'] = 100
     try:
         settings['findLimit'] = int(settings.get('findLimit') or 0)
     except (TypeError, ValueError):

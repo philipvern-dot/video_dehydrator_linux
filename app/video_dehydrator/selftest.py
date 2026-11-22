@@ -13,6 +13,8 @@ from .engine import (
     encode_row_snapshot,
     add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
     FIND_LIMITS, job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
+    CPU_TARGETS, EncodeAdmission, cpu_target_percent, dynamic_lane_count, encoder_threads,
+    safe_core_budget, split_core_budget, system_reserve, target_core_budget,
     remove_empty_directory, remove_hold_busy_marker, scan_limit_reached,
     ac3_frame_size, ac3_short_tail, copied_ac3, estimated_savings_bytes,
     encode_rate, force_convertible, format_force_report, format_over_ratio, format_remaining_time,
@@ -248,7 +250,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.0', 'app version')
+    check(app_version() == '1.1.1', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -277,6 +279,31 @@ def test_rules():
     check('opens a terminal, and runs its installer' in guide, 'guide update terminal')
     check(job_count('2') == 2 and job_count(1) == 1 and job_count('no') == 1, 'job count')
     check(job_count(6) == 6 and job_count(9) == 6 and job_count(0) == 1, 'job count stays between 1 and 6')
+    check(CPU_TARGETS == (25, 50, 75, 95, 100), 'cpu use choices')
+    check(cpu_target_percent('75') == 75 and cpu_target_percent('no') == 100 and cpu_target_percent(40) == 100, 'cpu use stays on a listed percent')
+    check(encoder_threads(528, 400, 16) == 3 and encoder_threads(720, 480, 16) == 3, 'sd pictures use 3 threads')
+    check(encoder_threads(1280, 720, 16) == 4, '720p uses 4 threads')
+    check(encoder_threads(1920, 1080, 16) == 8 and encoder_threads(3840, 2160, 16) == 8, '1080p and 4k use 8 threads')
+    check(encoder_threads(0, 0, 16) == 8 and encoder_threads(None, None, 4) == 4, 'a missing size stays within 8 and the node')
+    check(encoder_threads(1920, 1080, 4) == 4 and encoder_threads(-1, 10, 16) == 8, 'thread count stays positive and inside the node')
+    check(system_reserve(32) == 2 and system_reserve(4) == 1 and system_reserve(1) == 0, '100% leaves cores for the system')
+    check(safe_core_budget(32) == 30 and target_core_budget(32, 100) == 30, '100% on 32 cores uses 30')
+    check(target_core_budget(32, 95) == 28 and target_core_budget(32, 75) == 22, 'lower cpu use is a share of the safe budget')
+    check(target_core_budget(32, 50) == 15 and target_core_budget(32, 25) == 7, 'half and quarter cpu use')
+    check(split_core_budget([16, 16], 30) == [15, 15], 'a 30 core budget splits across two processors')
+    check(dynamic_lane_count(100, 30) == 10 and dynamic_lane_count(1, 30) == 1 and dynamic_lane_count(4, 30) == 4, 'lane count follows the budget and the batch')
+    admission = EncodeAdmission([32])
+    for index in range(10):
+        check(admission.try_admit(index, 3) is not None, 'ten small files fit in 32 cores')
+    check(sum(admission.free) == 2, 'ten small files leave 2 cores')
+    waiting = [('big', 8), ('later', 3)]
+    check(admission.try_admit(waiting[0][0], waiting[0][1]) is None, 'a large file waits when 8 cores are not free')
+    check('later' not in admission.running, 'a later small file does not pass a waiting large file')
+    admission.release(0)
+    admission.release(1)
+    check(admission.try_admit('big', 8) is not None, 'the large file starts once 8 cores are free')
+    check('later' not in admission.running, 'the file behind the large one is still waiting')
+    check('Dynamic encode batch jobs' in guide and 'CPU use' in guide and 'leaves one or two cores free' in guide, 'guide explains dynamic batch and cpu use')
     check(scan_limit_reached(4, 5) is False and scan_limit_reached(5, 5) and scan_limit_reached(9, 0) is False, 'scan limit')
     check(FIND_LIMITS == (5, 10, 25, 50, 100, 500, 1000), 'scan limits include 500 and 1000')
     check(scan_limit_reached(500, 500) and not scan_limit_reached(499, 500), '500 scan limit')
