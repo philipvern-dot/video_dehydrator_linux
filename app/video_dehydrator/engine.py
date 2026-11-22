@@ -1921,6 +1921,212 @@ def larger_file_note(reason, source_bytes=0, new_bytes=0, target=0, source_codec
     return ' '.join(sentences)
 
 
+def frame_seconds(rate) -> float:
+    """Nominal seconds per frame. 0 when the rate is missing or not a picture rate."""
+    text = str(rate or '').strip()
+    if not text or text == '0/0':
+        return 0.0
+    fps = 0.0
+    if '/' in text:
+        left, right = text.split('/', 1)
+        try:
+            num = float(left)
+            den = float(right)
+        except ValueError:
+            return 0.0
+        if num <= 0 or den <= 0:
+            return 0.0
+        fps = num / den
+    else:
+        try:
+            fps = float(text)
+        except ValueError:
+            return 0.0
+    if fps < 5 or fps > 120:
+        return 0.0
+    return 1.0 / fps
+
+
+def audio_samples_per_packet(codec, profile) -> int:
+    """Samples in one packet of a fixed-frame codec. 0 when the size is not fixed."""
+    name = str(codec or '').strip().lower()
+    prof = str(profile or '').strip().lower()
+    if name in ('mp3', 'mp2'):
+        return 1152
+    if name == 'ac3':
+        return 1536
+    if name in ('aac', 'aac_latm'):
+        if 'he-aac' in prof or prof.startswith('he') or 'sbr' in prof:
+            return 2048
+        return 1024
+    return 0
+
+
+def packet_span_sec(text: str):
+    """Seconds from the first packet time to the end of the last one."""
+    if text is None or not str(text).strip():
+        return None
+    start = None
+    end = None
+    for line in re.split(r'\r?\n', str(text)):
+        if not line:
+            continue
+        part = line.split(',')
+        if len(part) < 3:
+            continue
+        stamp = None
+        for token in (part[1], part[0]):
+            token = token.strip()
+            if token in ('', 'N/A'):
+                continue
+            try:
+                stamp = float(token)
+            except ValueError:
+                continue
+            break
+        if stamp is None or stamp < 0 or math.isnan(stamp) or math.isinf(stamp):
+            continue
+        try:
+            duration = float(part[2])
+        except ValueError:
+            duration = 0.0
+        if duration < 0 or duration > 5 or math.isnan(duration) or math.isinf(duration):
+            duration = 0.0
+        packet_end = stamp + duration
+        if start is None or stamp < start:
+            start = stamp
+        if end is None or packet_end > end:
+            end = packet_end
+    if start is None or end is None or end <= start:
+        return None
+    return end - start
+
+
+def presentation_count(text: str) -> int:
+    count = 0
+    if not text:
+        return 0
+    for line in re.split(r'\r?\n', str(text)):
+        if not line:
+            continue
+        token = line.split(',', 1)[0].strip()
+        if not token or token == 'N/A':
+            continue
+        try:
+            stamp = float(token)
+        except ValueError:
+            continue
+        if stamp >= 0 and not math.isnan(stamp) and not math.isinf(stamp):
+            count += 1
+    return count
+
+
+def _packet_csv(ffprobe: str, file_path: str, selector: str) -> str:
+    _code, out, _err = run_captured([
+        ffprobe, '-v', 'error', '-select_streams', selector,
+        '-show_entries', 'packet=pts_time,dts_time,duration_time',
+        '-of', 'csv=p=0', '--', file_path,
+    ])
+    return out or ''
+
+
+def measure_duration_evidence(ffprobe: str, file_path: str) -> dict:
+    """Indexed span plus the picture and audio clocks, ignoring timestamp holes.
+
+    audio is -1 when the file has no audio, and 0 when a track cannot be measured.
+    """
+    empty = {'indexed': 0.0, 'picture': 0.0, 'audio': 0.0}
+    if not ffprobe or not file_path or not os.path.isfile(file_path):
+        return empty
+    _code, out, _err = run_captured([
+        ffprobe, '-v', 'error', '-show_streams', '-print_format', 'json', '--', file_path,
+    ])
+    try:
+        payload = json.loads(out or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return empty
+    video = None
+    audios = []
+    for stream in payload.get('streams') or []:
+        kind = stream.get('codec_type')
+        if kind == 'audio':
+            audios.append(stream)
+            continue
+        if kind != 'video' or video is not None:
+            continue
+        disposition = stream.get('disposition') or {}
+        if str(disposition.get('attached_pic')) == '1':
+            continue
+        if _positive_int(stream.get('width')) <= 0:
+            continue
+        video = stream
+    rate = ''
+    if video:
+        rate = str(video.get('avg_frame_rate') or '')
+        if not rate or rate == '0/0':
+            rate = str(video.get('r_frame_rate') or '')
+    frame = frame_seconds(rate)
+    chunks = []
+    video_csv = _packet_csv(ffprobe, file_path, 'v:0')
+    picture = 0.0
+    if video_csv:
+        chunks.append(video_csv)
+        if frame > 0:
+            picture = presentation_count(video_csv) * frame
+    audio_clock = -1.0 if not audios else 0.0
+    if audios:
+        clocks = []
+        measurable = True
+        for index, stream in enumerate(audios):
+            samples = audio_samples_per_packet(stream.get('codec_name'), stream.get('profile'))
+            sample_rate = _positive_int(stream.get('sample_rate'))
+            csv = _packet_csv(ffprobe, file_path, f'a:{index}')
+            if csv:
+                chunks.append(csv)
+            if samples <= 0 or sample_rate <= 0 or not csv:
+                measurable = False
+                continue
+            clocks.append(presentation_count(csv) * samples / float(sample_rate))
+        if measurable and clocks:
+            first = clocks[0]
+            if all(abs(item - first) <= 2 for item in clocks):
+                audio_clock = first
+            else:
+                audio_clock = 0.0
+        else:
+            audio_clock = 0.0
+    indexed = packet_span_sec('\n'.join(chunks)) or 0.0
+    return {'indexed': float(indexed), 'picture': float(picture), 'audio': float(audio_clock)}
+
+
+def duration_basis(header, output, indexed=0.0, picture=0.0, audio=0.0) -> dict:
+    """Length to judge an encode by.
+
+    A header longer than the packets uses the packet span. A header longer
+    than the picture because of an empty timestamp hole uses the picture
+    clock when the audio clock matches it. A real shorter picture still fails.
+    audio below 0 means the file has no audio track.
+    """
+    limit = 2.0
+    try:
+        header = float(header or 0)
+        output = float(output or 0)
+        indexed = float(indexed or 0)
+        picture = float(picture or 0)
+        audio = float(0 if audio is None else audio)
+    except (TypeError, ValueError):
+        return {'changed': True, 'basis': 0.0}
+    basis = header
+    if abs(output - header) > limit and indexed > 0:
+        if (header - indexed) > limit and abs(output - indexed) <= limit:
+            basis = indexed
+    picture_matches = picture > 0 and abs(output - picture) <= limit
+    audio_matches = audio < 0 or (audio > 0 and abs(output - audio) <= limit)
+    if picture_matches and audio_matches and abs(output - basis) > limit:
+        basis = picture
+    return {'changed': abs(output - basis) > limit, 'basis': basis}
+
+
 def test_encoded_file(ffmpeg, ffprobe, temp, source_probe: Probe, handbrake_log: str, allow_audio_reencode: bool) -> dict:
     reasons = []
     if not os.path.isfile(temp):
@@ -1938,8 +2144,25 @@ def test_encoded_file(ffmpeg, ffprobe, temp, source_probe: Probe, handbrake_log:
     except Exception as exc:
         reasons.append(f'could not read the new file: {exc}')
         return {'ok': False, 'reason': '; '.join(reasons), 'out_probe': None, 'new_gibph': None, 'old_gibph': None, 'new_bytes': new_bytes}
+    basis = source_probe.duration_sec
     if abs(out.duration_sec - source_probe.duration_sec) > 2:
-        reasons.append(f'duration changed from {round(source_probe.duration_sec, 1)}s to {round(out.duration_sec, 1)}s')
+        evidence = {'indexed': 0.0, 'picture': 0.0, 'audio': 0.0}
+        source_path = getattr(source_probe, 'path', '') or ''
+        try:
+            evidence = measure_duration_evidence(ffprobe, source_path)
+        except Exception:
+            evidence = {'indexed': 0.0, 'picture': 0.0, 'audio': 0.0}
+        decision = duration_basis(
+            source_probe.duration_sec,
+            out.duration_sec,
+            evidence.get('indexed') or 0.0,
+            evidence.get('picture') or 0.0,
+            0.0 if evidence.get('audio') is None else evidence.get('audio'),
+        )
+        if decision['changed']:
+            reasons.append(f'duration changed from {round(source_probe.duration_sec, 1)}s to {round(out.duration_sec, 1)}s')
+        else:
+            basis = decision['basis']
     if out.width != source_probe.width or out.height != source_probe.height:
         reasons.append(f'picture size changed from {source_probe.width}x{source_probe.height} to {out.width}x{out.height}')
     first = decode_window(ffmpeg, temp, out.duration_sec, 'First')
@@ -1963,7 +2186,7 @@ def test_encoded_file(ffmpeg, ffprobe, temp, source_probe: Probe, handbrake_log:
         reasons.append(f'subtitles dropped from {source_probe.sub_count} to {out.sub_count}')
     if new_bytes >= source_probe.size_bytes:
         reasons.append('the new file is not smaller')
-    old_rate = gib_per_hour(source_probe.size_bytes, source_probe.duration_sec)
+    old_rate = gib_per_hour(source_probe.size_bytes, basis)
     new_rate = gib_per_hour(new_bytes, out.duration_sec)
     if new_rate is None or old_rate is None or new_rate >= old_rate:
         reasons.append('the new file is not smaller per hour')

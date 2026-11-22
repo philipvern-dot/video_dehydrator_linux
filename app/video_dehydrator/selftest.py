@@ -22,6 +22,7 @@ from .engine import (
     median_sample,
     FAULT_ISSUE_URL, fault_issue_request, format_fault_report, useful_handbrake_lines,
     harmless_decode_note, make_fault_record, merge_fault, merge_skip_row, over_band_id, remaining_estimate,
+    audio_samples_per_packet, duration_basis, frame_seconds, packet_span_sec, presentation_count,
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
@@ -250,7 +251,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.1', 'app version')
+    check(app_version() == '1.1.2', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -373,6 +374,46 @@ def _plan(root, relative, name):
         'name': name,
         'allow_local': True,
     }
+
+
+def test_duration_basis():
+    span = packet_span_sec('N/A,0.000000,0.041708\r\nN/A,2801.423625,0.041708')
+    check(span is not None and abs(span - 2801.465333) < 0.001, 'packet span uses the last timestamp')
+    from_pts = packet_span_sec('1.000000,N/A,0.040000\n2.000000,N/A,0.040000')
+    check(from_pts is not None and abs(from_pts - 1.04) < 0.001, 'packet span can use a presentation time')
+    check(packet_span_sec('') is None, 'an empty packet list has no span')
+    capped = packet_span_sec('0,0,99999\n10,10,0.040000')
+    check(capped is not None and abs(capped - 10.04) < 0.001, 'a bogus packet duration does not stretch the span')
+    kept = duration_basis(3000.6, 2801.2, 2801.465333)
+    check(not kept['changed'], 'a long header does not reject the real picture')
+    check(abs(kept['basis'] - 2801.465333) < 0.001, 'the rate uses the real picture length')
+    dropped = duration_basis(3000, 2801, 3000)
+    check(dropped['changed'] and abs(dropped['basis'] - 3000) < 0.001, 'a short encode still fails when the picture is full length')
+    normal = duration_basis(100, 100.4, 40)
+    check(not normal['changed'] and abs(normal['basis'] - 100) < 0.001, 'a matching length keeps the header')
+    shorter = duration_basis(3000, 2000, 2801)
+    check(shorter['changed'], 'a file shorter than the picture still fails')
+    unread = duration_basis(3000.6, 2801.2, 0)
+    check(unread['changed'], 'a long header still fails when the picture length cannot be read')
+    plow = duration_basis(3075.6, 3072.5, 3075.5, 3072.444, 3072.469)
+    check(not plow['changed'] and abs(plow['basis'] - 3072.444) < 0.001, 'a timestamp hole keeps the pictures')
+    station = duration_basis(3081.2, 3076.4, 3081.2, 3076.365, 3076.288)
+    check(not station['changed'], 'Red River Station keeps the pictures')
+    fever = duration_basis(2903.7, 2900.5, 2903.7, 2900.440, 2900.480)
+    check(not fever['changed'], 'Gold Fever keeps the pictures')
+    cut = duration_basis(2993.8, 2985.6, 2993.8, 2993.8, 2993.8)
+    check(cut['changed'], 'a shorter picture still fails')
+    audio_cut = duration_basis(3075.6, 3072.5, 3075.5, 3072.444, 3075.6)
+    check(audio_cut['changed'], 'a timestamp hole still fails when the audio is longer')
+    silent = duration_basis(3075.6, 3072.5, 3075.5, 3072.444, -1)
+    check(not silent['changed'], 'a timestamp hole with no audio uses the picture clock')
+    unknown = duration_basis(3075.6, 3072.5, 3075.5, 3072.444, 0)
+    check(unknown['changed'], 'a timestamp hole still fails when the audio clock was not read')
+    check(audio_samples_per_packet('aac', 'LC') == 1024, 'AAC-LC is 1024 samples')
+    check(audio_samples_per_packet('aac', 'HE-AAC') == 2048, 'HE-AAC is 2048 samples')
+    check(abs(frame_seconds('24000/1001') - (1001 / 24000.0)) < 0.0000001, '23.976 frame length')
+    check(frame_seconds('0/0') == 0, 'a missing frame rate has no length')
+    check(presentation_count('0.000,0.000,0.042\n0.042,0.042,0.042\nN/A,0.084,0.042') == 2, 'presentation count skips a missing time')
 
 
 def test_recycle():
@@ -596,6 +637,7 @@ def test_scan_posts_events():
 
 def main():
     test_rules()
+    test_duration_basis()
     test_recycle()
     test_scan_posts_events()
     print('SELF TEST OK')
