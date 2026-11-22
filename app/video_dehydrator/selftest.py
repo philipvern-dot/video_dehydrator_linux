@@ -22,7 +22,7 @@ from .engine import (
     median_sample,
     FAULT_ISSUE_URL, fault_issue_request, format_fault_report, useful_handbrake_lines,
     harmless_decode_note, make_fault_record, merge_fault, merge_skip_row, over_band_id, remaining_estimate,
-    audio_samples_per_packet, duration_basis, frame_seconds, packet_span_sec, presentation_count,
+    audio_samples_per_packet, duration_basis, frame_seconds, job_view_height, packet_span_sec, presentation_count,
     space_saved_bytes, trailing_ac3_note, over_ratio, owned_plexignore_text,
     plexignore_lines, remembered_skip, set_budget_picks, size_skip_reason, target_kbps,
 )
@@ -251,7 +251,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.2', 'app version')
+    check(app_version() == '1.1.3', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -414,6 +414,13 @@ def test_duration_basis():
     check(abs(frame_seconds('24000/1001') - (1001 / 24000.0)) < 0.0000001, '23.976 frame length')
     check(frame_seconds('0/0') == 0, 'a missing frame rate has no length')
     check(presentation_count('0.000,0.000,0.042\n0.042,0.042,0.042\nN/A,0.084,0.042') == 2, 'presentation count skips a missing time')
+    ten = 8 + (10 * 36)
+    check(job_view_height(ten, 0) == 8 + (4 * 36), 'four encode bars show before the list scrolls')
+    check(job_view_height(8 + (2 * 36), 0) == 8 + (2 * 36), 'two encode bars do not leave empty space')
+    check(job_view_height(ten, 80) == 8 + (4 * 36) + 80, 'dragging the encode bars keeps the extra pixels')
+    check(job_view_height(ten, 9999) == ten, 'the encode bars do not grow past the files')
+    check(job_view_height(ten, -9999) == 8 + 36, 'the encode bars keep one row')
+    check(job_view_height(0, 40) == 0, 'hidden encode bars take no space')
 
 
 def test_recycle():

@@ -37,7 +37,7 @@ from .engine import (
     FAULT_ISSUE_URL, fault_issue_request, format_fault_report,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
     format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
-    lane_bar_text, lane_pass_name,
+    lane_bar_text, lane_pass_name, job_view_height,
     is_encode_progress_line, is_video_file, larger_file_note, FIND_LIMITS,
     batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     CPU_TARGETS, EncodeAdmission, cpu_target_percent, dynamic_lane_count, processor_layout, split_core_budget, target_core_budget,
@@ -1494,27 +1494,49 @@ class MainWindow(QMainWindow):
         self.splitter.splitterMoved.connect(self._split_moved)
         self.split_handle = self.splitter.handle(1)
         self.split_handle.installEventFilter(self)
-        root.addWidget(self.splitter, 1)
 
         self.eta = QLabel('')
         self.eta.setVisible(False)
         self.eta.setWordWrap(True)
-        root.addWidget(self.eta)
         self.batch_count = QLabel('')
         self.batch_count.setVisible(False)
         count_font = self.batch_count.font()
         count_font.setBold(True)
         self.batch_count.setFont(count_font)
-        root.addWidget(self.batch_count)
         self.job_bars = []
         self.job_host = QWidget()
+        self.job_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         job_layout = QVBoxLayout(self.job_host)
         job_layout.setContentsMargins(0, 4, 0, 4)
         job_layout.setSpacing(6)
         for _index in range(6):
             self._add_job_bar()
-        self.job_host.setVisible(False)
-        root.addWidget(self.job_host)
+        self.job_scroll = QScrollArea()
+        self.job_scroll.setWidgetResizable(True)
+        self.job_scroll.setFrameShape(QFrame.NoFrame)
+        self.job_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.job_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.job_scroll.setWidget(self.job_host)
+        self.job_scroll.setVisible(False)
+        upper = QWidget()
+        upper_layout = QVBoxLayout(upper)
+        upper_layout.setContentsMargins(0, 0, 0, 0)
+        upper_layout.setSpacing(0)
+        upper_layout.addWidget(self.splitter, 1)
+        upper_layout.addWidget(self.eta)
+        upper_layout.addWidget(self.batch_count)
+        self.job_splitter = QSplitter(Qt.Vertical)
+        self.job_splitter.addWidget(upper)
+        self.job_splitter.addWidget(self.job_scroll)
+        self.job_splitter.setStretchFactor(0, 1)
+        self.job_splitter.setStretchFactor(1, 0)
+        self.job_splitter.setChildrenCollapsible(True)
+        self.job_splitter.splitterMoved.connect(self._job_split_moved)
+        self.job_handle = self.job_splitter.handle(1)
+        self.job_handle.setVisible(False)
+        self.job_handle.installEventFilter(self)
+        self._job_split_ready = False
+        root.addWidget(self.job_splitter, 1)
         bottom = QHBoxLayout()
         self.status = QLabel('Ready')
         self.progress = QProgressBar()
@@ -1558,6 +1580,7 @@ class MainWindow(QMainWindow):
             'cpuTarget': cpu_target_percent(self.cpu_use.currentData()),
             'findLimit': int(self.find_box.currentData() or 0),
             'listExtra': int(self.settings.get('listExtra') or 0),
+            'jobExtra': int(self.settings.get('jobExtra') or 0),
             'columnOrder': self._column_names(),
             'columnWidths': self._column_widths(),
         })
@@ -1605,7 +1628,8 @@ class MainWindow(QMainWindow):
             self.split_handle: 'Drag to make the video list taller or shorter. Double-click to put it back.',
             self.activity: 'Saved space, skipped videos, and problems are listed here.',
             self.progress: 'How far the current file has been encoded. The two passes share the bar evenly.',
-            self.job_host: 'Each file that is encoding has its own bar. The bars change about twice a second.',
+            self.job_scroll: 'Each file that is encoding has its own bar. The bars change about twice a second.',
+            self.job_handle: 'Drag to make the encode bars taller or shorter. Double-click to put them back.',
             self.batch_count: 'How many files in this batch have started.',
             self.eta: 'This file is the encode in progress. Estimated time remaining is the rest of the batch.',
             self.status: 'What the program is doing right now.',
@@ -1675,9 +1699,13 @@ class MainWindow(QMainWindow):
         self.persist()
 
     def eventFilter(self, watched, event):
-        if watched is getattr(self, 'split_handle', None) and event.type() == QEvent.MouseButtonDblClick:
-            self._reset_split()
-            return True
+        if event.type() == QEvent.MouseButtonDblClick:
+            if watched is getattr(self, 'split_handle', None):
+                self._reset_split()
+                return True
+            if watched is getattr(self, 'job_handle', None):
+                self._reset_job_split()
+                return True
         return super().eventFilter(watched, event)
 
     def _apply_split(self):
@@ -1704,10 +1732,54 @@ class MainWindow(QMainWindow):
         self._apply_split()
         self.persist()
 
+    def _job_content_height(self) -> int:
+        hint = self.job_host.sizeHint().height()
+        return hint if hint > 0 else 0
+
+    def _job_row_height(self) -> int:
+        if self.job_bars:
+            hint = self.job_bars[0][0].sizeHint().height()
+            if hint > 0:
+                return hint
+        return 36
+
+    def _apply_job_split(self):
+        if not self.job_scroll.isVisible():
+            total = self.job_splitter.height()
+            if total > 0:
+                self.job_splitter.setSizes([total, 0])
+            return
+        total = self.job_splitter.height()
+        if total < 1:
+            return
+        content = self._job_content_height()
+        row = self._job_row_height()
+        extra = int(self.settings.get('jobExtra') or 0)
+        view = job_view_height(content, extra, row, 0)
+        view = min(view, max(row, total - 180))
+        self.job_splitter.setSizes([max(180, total - view), view])
+        self._job_split_ready = True
+
+    def _job_split_moved(self, _pos, _index):
+        if self.loading or not self._job_split_ready or not self.job_scroll.isVisible():
+            return
+        content = self._job_content_height()
+        row = self._job_row_height()
+        default = job_view_height(content, 0, row, 0)
+        self.settings['jobExtra'] = int(self.job_splitter.sizes()[1] - default)
+        self.persist()
+
+    def _reset_job_split(self):
+        self.settings['jobExtra'] = 0
+        self._job_split_ready = False
+        self._apply_job_split()
+        self.persist()
+
     def showEvent(self, event):
         super().showEvent(event)
         if not self._split_ready:
             QTimer.singleShot(0, self._apply_split)
+        QTimer.singleShot(0, self._apply_job_split)
         if not self._update_started:
             self._update_started = True
             QTimer.singleShot(600, self.check_for_updates)
@@ -2044,8 +2116,16 @@ class MainWindow(QMainWindow):
         while len(self.job_bars) < len(rows):
             self._add_job_bar()
         multi = len(rows) > 1
-        self.job_host.setVisible(multi)
+        self.job_scroll.setVisible(multi)
+        self.job_handle.setVisible(multi)
         self.progress.setVisible(not multi)
+        if multi:
+            self.job_scroll.setMinimumHeight(self._job_row_height())
+            QTimer.singleShot(0, self._apply_job_split)
+        else:
+            self.job_scroll.setMinimumHeight(0)
+            self._job_split_ready = False
+            self._apply_job_split()
         width = max(160, self.job_host.width() or self.width() - 48)
         for index, (row_widget, label, bar) in enumerate(self.job_bars):
             if index >= len(rows):

@@ -1921,6 +1921,35 @@ def larger_file_note(reason, source_bytes=0, new_bytes=0, target=0, source_codec
     return ' '.join(sentences)
 
 
+def job_view_height(content, extra=0, row=36, chrome=8) -> int:
+    """Visible height of the encode bars.
+
+    Four bars show at once. A saved drag adds or removes pixels. The list
+    never grows past its contents, and it keeps at least one bar.
+    """
+    try:
+        content = int(content)
+        extra = int(extra or 0)
+        row = int(row or 36)
+        chrome = int(chrome or 0)
+    except (TypeError, ValueError):
+        return 0
+    if content < 1:
+        return 0
+    if row < 1:
+        row = 36
+    if chrome < 0:
+        chrome = 0
+    default = min(content, chrome + (row * 4))
+    minimum = min(content, chrome + row)
+    view = default + extra
+    if view < minimum:
+        view = minimum
+    if view > content:
+        view = content
+    return view
+
+
 def frame_seconds(rate) -> float:
     """Nominal seconds per frame. 0 when the rate is missing or not a picture rate."""
     text = str(rate or '').strip()

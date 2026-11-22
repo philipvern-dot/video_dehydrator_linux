@@ -27,6 +27,7 @@ DEFAULTS = {
     'cpuTarget': 100,
     'findLimit': 0,
     'listExtra': 0,
+    'jobExtra': 0,
     'columnOrder': [],
     'columnWidths': {},
 }
@@ -52,6 +53,18 @@ def load_settings() -> dict:
         settings['listExtra'] = int(settings.get('listExtra') or 0)
     except (TypeError, ValueError):
         settings['listExtra'] = 0
+    if settings['listExtra'] > 800:
+        settings['listExtra'] = 800
+    if settings['listExtra'] < -400:
+        settings['listExtra'] = -400
+    try:
+        settings['jobExtra'] = int(settings.get('jobExtra') or 0)
+    except (TypeError, ValueError):
+        settings['jobExtra'] = 0
+    if settings['jobExtra'] > 800:
+        settings['jobExtra'] = 800
+    if settings['jobExtra'] < -400:
+        settings['jobExtra'] = -400
     try:
         settings['jobs'] = int(settings.get('jobs') or 1)
     except (TypeError, ValueError):
