@@ -6,7 +6,6 @@ import html
 import math
 import os
 import queue
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -33,24 +32,25 @@ from .engine import (
     BUDGET_ANCHORS, BUDGET_FACTORS, anchor_budget, app_version, bloat_decision,
     budget_choice_label, budget_pick_pack, bundled_tools, compare_versions,
     LINUX_DOWNLOAD_PREFIX, LINUX_RELEASES, linux_release_asset, linux_release_is_update,
-    add_hold_busy_marker, apply_encode_snapshot, encoder_name, encode_row_snapshot, estimated_savings_bytes, force_convertible, force_video_paths,
+    apply_encode_snapshot, encoder_name, encode_row_snapshot, estimated_savings_bytes, force_convertible, force_video_paths,
     FAULT_ISSUE_URL, fault_issue_request, format_fault_report,
     format_budget_gib, format_byte_size, format_clock, format_eta_text, format_force_report, format_remaining_time,
-    format_over_ratio, format_rate, handbrake_arguments, handbrake_progress,
+    format_over_ratio, format_rate,
     lane_bar_text, lane_pass_name, job_view_height,
-    is_encode_progress_line, is_video_file, larger_file_note, FIND_LIMITS,
-    batch_count_text, batch_wall_seconds, delete_targets, encode_command, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
+    is_video_file, FIND_LIMITS,
+    batch_count_text, batch_wall_seconds, delete_targets, encode_cushion_seconds, encode_rate, job_count, live_encode_rate,
     CPU_TARGETS, EncodeAdmission, cpu_target_percent, dynamic_lane_count, processor_layout, split_core_budget, target_core_budget,
-    mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor, numa_node_count,
+    mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor,
     make_fault_record, merge_fault,
-    output_path_missing, over_band_id, over_ratio, pass_two_did_not_start, pixel_seconds, probe_file, remaining_estimate,
-    remembered_skip, remove_empty_directory, remove_hold_busy_marker, remove_kept_original, remove_skip_row, replace_plan,
-    replace_with_encode, run_lines, scan_limit_reached, set_budget_picks, size_skip_reason,
-    space_saved_bytes, target_kbps, test_encoded_file, undo_replaced_file,
+    over_band_id, over_ratio, pixel_seconds, probe_file, remaining_estimate,
+    remembered_skip, remove_kept_original, remove_skip_row,
+    scan_limit_reached, set_budget_picks,
+    space_saved_bytes, target_kbps, undo_replaced_file,
 )
 from .recycle import RecycleBook, set_purge_enabled
+from .filejob import apply_pass, reset_clock, run_isolated_file
 from .store import (
-    append_convert_log, load_settings, read_faults, read_pending, read_skips, save_settings,
+    load_settings, read_faults, read_pending, read_skips, save_settings,
     write_faults, write_pending, write_skips,
 )
 
@@ -305,8 +305,10 @@ class EncodeSlot:
 class ConvertWorker(threading.Thread):
     """Encode files off the window thread.
 
-    Progress is posted on a queue. The window applies it. This is a normal
-    Python thread. A Qt thread crashed the interpreter during long batches.
+    Each file runs in its own Python process. A native crash in that process
+    stops the file and the batch keeps going. Progress is posted on a queue.
+    The window applies it. This is a normal Python thread. A Qt thread crashed
+    the interpreter during long batches.
     """
 
     def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1, dynamic=False, cpu_target=100, node_cores=None):
@@ -367,6 +369,24 @@ class ConvertWorker(threading.Thread):
         )
         self._post('fault', record)
 
+    def note_skip(self, source, size_bytes, kbps):
+        with self._state:
+            self.skips = merge_skip_row(self.skips, source, size_bytes, kbps or 0)
+
+    def note_unskip(self, source):
+        with self._state:
+            self.skips = remove_skip_row(self.skips, source)
+
+    def note_saved(self, amount):
+        try:
+            number = int(amount or 0)
+        except (TypeError, ValueError):
+            return
+        if number <= 0:
+            return
+        with self._state:
+            self.saved += number
+
     def _slot(self) -> EncodeSlot:
         slot = getattr(self._tls, 'slot', None)
         if slot is None:
@@ -375,23 +395,7 @@ class ConvertWorker(threading.Thread):
         return slot
 
     def _reset_clock(self):
-        slot = self._slot()
-        slot.pass_started = time.monotonic()
-        slot.pass1_sec = 0.0
-        slot.task = 0
-        slot.progress_info = None
-        slot.checking = False
-        slot.remembered = False
-        slot.ten_bit = False
-        slot.pixels = 0.0
-        slot.live8 = []
-        slot.live10 = []
-        slot.file_samples = []
-        slot.batch_samples = []
-        slot.shown_at = None
-        slot.shown_key = ''
-        slot.percent = 0.0
-        slot.file_seconds = 0.0
+        reset_clock(self._slot())
 
     def _add_sample(self, bucket, value):
         try:
@@ -421,18 +425,7 @@ class ConvertWorker(threading.Thread):
         slot.remembered = True
 
     def _note_pass(self, info):
-        slot = self._slot()
-        task = int(info.get('task') or 0)
-        if slot.task >= 1 and task > slot.task and slot.task == 1 and task >= 2:
-            slot.pass1_sec = max(0.0, time.monotonic() - slot.pass_started)
-            slot.pass_started = time.monotonic()
-        elif task > slot.task:
-            slot.pass_started = time.monotonic()
-        if task > slot.task:
-            slot.live8 = []
-            slot.live10 = []
-            slot.task = task
-        slot.progress_info = info
+        apply_pass(self._slot(), info, time.monotonic())
 
     def _chosen_rate(self, ten):
         slot = self._slot()
@@ -782,207 +775,7 @@ class ConvertWorker(threading.Thread):
         row['checked'] = True
 
     def convert_row(self, row):
-        source = row['source'] or row['path']
-        previous = row['status']
-        verb = 'Forcing' if self.force else 'Converting'
-        slot = self._slot()
-        slot.name = os.path.basename(source)
-        self._reset_clock()
-        slot.name = os.path.basename(source)
-        self._set_progress(0)
-        if self.cancel.is_set():
-            self._restore_status(row, previous)
-            self._post_row(row)
-            return
-        try:
-            probe = probe_file(str(self.tools['ffprobe']), source)
-        except Exception as exc:
-            row['status'] = 'Failed'
-            row['reason'] = str(exc)
-            row['checked'] = True
-            self._post('activity', f'Could not read {os.path.basename(source)}. {exc}', 'err')
-            self._note_fault('unreadable', source, str(exc))
-            self._post_row(row)
-            return
-        if self._settle_pool(row, probe) == 'requeue':
-            return 'requeue'
-        self._post('activity', self._start_line(verb, slot.name), 'text')
-        row['status'] = 'Converting'
-        self._post_row(row)
-        self._emit_eta()
-        decision = bloat_decision(probe)
-        if self.force and not force_convertible(decision):
-            row['status'] = 'Left alone'
-            row['checked'] = False
-            row['reason'] = decision.get('reason') or 'Left alone.'
-            self._post('activity', f"Left {os.path.basename(source)} alone. {row['reason']}", 'text')
-            self._post_row(row)
-            return
-        slot = self._slot()
-        row['ten_bit'] = encoder_name(probe) == 'x265_10bit'
-        row['width'] = probe.width
-        row['height'] = probe.height
-        row['duration'] = probe.duration_sec
-        slot.ten_bit = bool(row['ten_bit'])
-        slot.pixels = pixel_seconds(probe.width, probe.height, probe.duration_sec)
-        plan = replace_plan(source)
-        if plan['blocked']:
-            row['status'] = 'Failed'
-            row['reason'] = 'A file already has the new name.'
-            row['checked'] = True
-            self._post('activity', row['reason'] + ' ' + plan['final'], 'err')
-            self._post_row(row)
-            return
-        os.makedirs(plan['hold_dir'], exist_ok=True)
-        encoder = encoder_name(probe)
-        kbps = target_kbps(probe.width, probe.height)
-        pool = self._pool_size()
-        output_retries = 0
-        single_pass = False
-        handbrake_log = ''
-        while True:
-            add_hold_busy_marker(plan)
-            args = handbrake_arguments(source, plan['temp'], probe, kbps, encoder, self.reencode, pool, single_pass)
-            command = encode_command(
-                str(self.tools['handbrake']), args, self.jobs, int(getattr(self._tls, 'node', 0) or 0),
-                numa_node_count(), shutil.which('numactl') is not None,
-            )
-            log_lines = []
-
-            def on_line(line):
-                log_lines.append(line)
-                if len(log_lines) > 500:
-                    del log_lines[:-500]
-                info = handbrake_progress(line)
-                if info is not None:
-                    task = int(info.get('task') or 0)
-                    changed = task != int(getattr(self._slot(), 'paint_task', 0) or 0)
-                    self._slot().paint_task = task
-                    self._note_pass(info)
-                    if self._set_progress(info['overall'], force=changed):
-                        self._emit_eta()
-                elif self.detailed and line and not is_encode_progress_line(line):
-                    prefix = f'{os.path.basename(source)}  ' if self.jobs > 1 else ''
-                    self._post('activity', prefix + line, 'dim')
-
-            code, _joined = run_lines(command, on_line, self.cancel)
-            handbrake_log = '\n'.join(log_lines)
-            if self.cancel.is_set():
-                break
-            missing_file = code != 0 or not os.path.isfile(plan['temp'])
-            if missing_file and output_path_missing(handbrake_log) and output_retries < 2:
-                output_retries += 1
-                if os.path.isfile(plan['temp']):
-                    os.remove(plan['temp'])
-                self._post('activity', f'The output folder was missing for {os.path.basename(source)}. Trying the two-pass encode again.', 'text')
-                continue
-            if missing_file and not single_pass and not output_path_missing(handbrake_log) and pass_two_did_not_start(handbrake_log):
-                single_pass = True
-                if os.path.isfile(plan['temp']):
-                    os.remove(plan['temp'])
-                self._post('activity', f'The two-pass encode did not start for {os.path.basename(source)}. Trying one pass.', 'text')
-                continue
-            break
-        if self.cancel.is_set():
-            remove_hold_busy_marker(plan)
-            if os.path.isfile(plan['temp']):
-                os.remove(plan['temp'])
-            remove_empty_directory(plan['hold_dir'], self.book)
-            self._restore_status(row, previous)
-            self._post('activity', f"Stopped {os.path.basename(source)}. The original stayed.", 'text')
-            self._post_row(row)
-            return
-        if code != 0 or not os.path.isfile(plan['temp']):
-            remove_hold_busy_marker(plan)
-            if os.path.isfile(plan['temp']):
-                os.remove(plan['temp'])
-            remove_empty_directory(plan['hold_dir'], self.book)
-            row['status'] = 'Failed'
-            row['checked'] = True
-            row['reason'] = f'HandBrake stopped ({code}).'
-            append_convert_log('FAIL', row['reason'], source, '', '', probe.size_bytes, 0, 0, 0, probe.width, probe.height, kbps)
-            self._post('activity', f"Failed {os.path.basename(source)}. {row['reason']}", 'err')
-            self._note_fault(
-                'encode', source, row['reason'], probe=probe, old_bytes=probe.size_bytes, kbps=kbps,
-                command=command, handbrake_log=handbrake_log, handbrake_code=code,
-            )
-            self._post_row(row)
-            return
-        self._remember_finished()
-        self._slot().checking = True
-        self._set_progress(self._slot().percent, force=True)
-        self._emit_eta()
-        remove_hold_busy_marker(plan)
-        checked = test_encoded_file(
-            str(self.tools['ffmpeg']), str(self.tools['ffprobe']), plan['temp'], probe, handbrake_log, self.reencode,
-        )
-        if not checked['ok']:
-            if os.path.isfile(plan['temp']):
-                os.remove(plan['temp'])
-            remove_empty_directory(plan['hold_dir'], self.book)
-            if size_skip_reason(checked['reason']):
-                note = larger_file_note(
-                    checked['reason'], probe.size_bytes, checked['new_bytes'], kbps,
-                    probe.audio_codecs, (checked['out_probe'].audio_codecs if checked['out_probe'] else []),
-                )
-                row['status'] = 'Skipped'
-                row['checked'] = False
-                row['reason'] = note or checked['reason']
-                with self._state:
-                    self.skips = merge_skip_row(self.skips, source, probe.size_bytes, kbps or 0)
-                append_convert_log('SKIP', row['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-                self._post('activity', 'Skipped. ' + row['reason'], 'text')
-            else:
-                row['status'] = 'Failed'
-                row['checked'] = True
-                row['reason'] = checked['reason']
-                append_convert_log('FAIL', checked['reason'], source, '', '', probe.size_bytes, checked['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-                self._post('activity', f"Failed {os.path.basename(source)}. {checked['reason']}", 'err')
-                self._note_fault(
-                    'check', source, checked['reason'], probe=probe, out_probe=checked.get('out_probe'),
-                    old_bytes=probe.size_bytes, new_bytes=checked.get('new_bytes') or 0,
-                    old_gibph=checked.get('old_gibph'), new_gibph=checked.get('new_gibph'), kbps=kbps,
-                    command=command, handbrake_log=handbrake_log, handbrake_code=code,
-                )
-            self._post_row(row)
-            return
-        try:
-            with self._state:
-                swap = replace_with_encode(source, plan['temp'], self.delete_original, self.book)
-        except Exception as exc:
-            row['status'] = 'Failed'
-            row['reason'] = str(exc)
-            row['checked'] = True
-            self._post('activity', f'Could not replace {os.path.basename(source)}. {exc}', 'err')
-            self._post_row(row)
-            return
-        row['new'] = swap['new_path']
-        row['path'] = swap['new_path']
-        row['name'] = os.path.basename(swap['new_path'])
-        row['kept'] = swap['kept_path'] or ''
-        row['source'] = source
-        row['old_bytes'] = swap['old_bytes']
-        row['size'] = swap['new_bytes']
-        row['estimate'] = None
-        with self._state:
-            self.saved += max(0, swap['old_bytes'] - swap['new_bytes'])
-        if swap['deleted']:
-            row['status'] = 'Original deleted'
-            row['pending_id'] = ''
-            row['checked'] = False
-            append_convert_log('DELETED', 'ok', source, swap['new_path'], '', swap['old_bytes'], swap['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-        else:
-            row['status'] = 'Ready to delete'
-            row['pending_id'] = uuid.uuid4().hex
-            row['batch'] = self.batch
-            row['checked'] = False
-            append_convert_log('KEPT', 'ok', source, swap['new_path'], swap['kept_path'], swap['old_bytes'], swap['new_bytes'], checked['old_gibph'], checked['new_gibph'], probe.width, probe.height, kbps)
-        with self._state:
-            self.skips = remove_skip_row(self.skips, source)
-        self._post('activity', f"Finished {row['name']}.", 'ok')
-        self._set_progress(100)
-        self._post_row(row)
-
+        return run_isolated_file(self, row)
 
 class ForceWorker(threading.Thread):
     """Walk a manual folder off the window thread.

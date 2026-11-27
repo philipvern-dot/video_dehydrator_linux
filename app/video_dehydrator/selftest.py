@@ -251,7 +251,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.3', 'app version')
+    check(app_version() == '1.1.3.1', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -642,11 +642,247 @@ def test_scan_posts_events():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_encode_child():
+    """One file runs outside the window, and a dead child does not encode in-process."""
+    import sys
+    from types import SimpleNamespace
+
+    from .engine import Probe, app_dir, replace_plan
+    loaded = {name for name in sys.modules if name.startswith('PySide') or name == 'video_dehydrator.ui'}
+    from . import filejob
+    from .filejob import (
+        PipeHost, abandon_file, encode_file, merge_worker_row, run_isolated_file, wire_row,
+    )
+    from .recycle import RecycleBook, set_purge_enabled
+    loaded_after = {name for name in sys.modules if name.startswith('PySide') or name == 'video_dehydrator.ui'}
+    check(loaded == loaded_after, 'importing the encode child loaded the window')
+
+    source = open(filejob.__file__, encoding='utf-8').read()
+    check('PySide' not in source, 'the encode child imports PySide')
+    check('video_dehydrator.ui' not in source and 'import ui' not in source, 'the encode child imports the window')
+    window = open(os.path.join(os.path.dirname(__file__), 'ui.py'), encoding='utf-8').read()
+    worker = _class_body(window, 'ConvertWorker')
+    method = worker.split('def convert_row(', 1)[1]
+    body = []
+    for line in method.splitlines()[1:]:
+        if line.startswith('    def ') or line.startswith('class '):
+            break
+        body.append(line)
+    body_text = '\n'.join(body)
+    check('run_isolated_file(self, row)' in body_text, 'convert_row does not use the encode child')
+    check('probe_file' not in body_text and 'handbrake' not in body_text.lower(), 'convert_row still encodes in the window')
+
+    probe = Probe(width=320, height=240, path='movie.mkv')
+    row = {'source': 'movie.mkv', 'path': 'movie.mkv', 'status': 'Bloated', 'probe': probe}
+    posted = wire_row(row)
+    check('probe' not in posted, 'a child row kept the probe object')
+    merge_worker_row(row, {'status': 'Failed', 'probe': {'width': 1}})
+    check(row['status'] == 'Failed', 'a child row did not update')
+    check(row['probe'] is probe, 'a child row replaced the probe object')
+
+    class CancelHost:
+        def __init__(self):
+            self.cancel = threading.Event()
+            self.cancel.set()
+            self.force = False
+            self.slot = SimpleNamespace(name='')
+            self.posted = []
+
+            class Tools:
+                def __getitem__(self, key):
+                    raise SystemExit('a cancelled file used a tool')
+
+            self.tools = Tools()
+
+        def _slot(self):
+            return self.slot
+
+        def _reset_clock(self):
+            pass
+
+        def _set_progress(self, value, force=False):
+            return True
+
+        def _restore_status(self, item, previous):
+            item['status'] = previous
+            item['checked'] = True
+
+        def _post_row(self, item):
+            self.posted.append(dict(item))
+
+    cancel_host = CancelHost()
+    cancel_row = {'source': 'movie.mkv', 'path': 'movie.mkv', 'status': 'Can shrink', 'checked': True}
+    check(encode_file(cancel_host, cancel_row) is None, 'a cancelled file returned a result')
+    check(cancel_row['status'] == 'Can shrink', 'a cancelled file changed status')
+    check(cancel_host.posted and cancel_host.posted[0]['status'] == 'Can shrink', 'a cancelled file was not posted')
+
+    events = []
+    pool_host = PipeHost({
+        'dynamic': True,
+        'locked_pool': False,
+        'pool': 8,
+        'node': 1,
+        'node_cap': 16,
+        'jobs': 2,
+        'tools': {},
+        'batch': 'batch',
+    }, threading.Event(), emit=events.append)
+    small = SimpleNamespace(width=640, height=480)
+    check(pool_host._settle_pool({}, small) == 'requeue', 'a smaller picture kept the large thread pool')
+    check(events and events[-1]['op'] == 'requeue' and events[-1]['need'] == 3, 'a pool change was not reported')
+    check(pool_host._settle_pool({}, SimpleNamespace(width=1920, height=1080)) is None, 'a matching picture was sent back')
+    pool_host.locked_pool = True
+    check(pool_host._settle_pool({}, small) is None, 'a settled picture was sent back again')
+
+    class Lane:
+        def __init__(self, tools):
+            self.events = []
+            self.cancel = threading.Event()
+            self.tools = tools
+            self.reencode = False
+            self.delete_original = False
+            self.detailed = False
+            self.force = False
+            self.jobs = 1
+            self.dynamic = False
+            self.cpu_target = 100
+            self.batch = 'batch'
+            self.saved = 0
+            self.book = RecycleBook()
+            self.skips = []
+            self._admission = None
+            self._tls = SimpleNamespace(node=0, pool=0)
+            self._state = threading.Lock()
+            self.slot = SimpleNamespace(
+                name='', percent=0.0, checking=False, ten_bit=False, pixels=0.0,
+                paint_task=0, pass_started=0.0, pass1_sec=0.0, task=0, progress_info=None,
+                remembered=False, live8=[], live10=[], file_samples=[], batch_samples=[],
+                shown_at=None, shown_key='', file_seconds=0.0,
+            )
+
+        def _slot(self):
+            return self.slot
+
+        def _reset_clock(self):
+            from .filejob import reset_clock
+            reset_clock(self.slot)
+
+        def _set_progress(self, value, force=False):
+            self.slot.percent = float(value)
+            return True
+
+        def _note_pass(self, info):
+            self.events.append(('pass', info))
+
+        def _emit_eta(self):
+            self.events.append(('eta',))
+
+        def _remember_finished(self):
+            self.events.append(('remember',))
+
+        def _post(self, kind, *payload):
+            self.events.append((kind, payload))
+
+        def _post_row(self, item):
+            self._post('file', dict(item))
+
+        def _note_fault(self, kind, source, reason, probe=None, out_probe=None, old_bytes=0, new_bytes=0, old_gibph=None, new_gibph=None, kbps=0, command=None, handbrake_log='', handbrake_code=None):
+            self.events.append(('fault-call', reason, handbrake_log))
+
+        def note_skip(self, path, size_bytes, kbps):
+            self.events.append(('skip-add', path))
+
+        def note_unskip(self, path):
+            self.events.append(('skip-remove', path))
+
+        def _settle_pool(self, item, picture):
+            return None
+
+        def _pool_size(self):
+            return 0
+
+    root = tempfile.mkdtemp()
+    previous_purge = None
+    from . import recycle as recycle_mod
+    previous_purge = recycle_mod._purge_choice
+    set_purge_enabled(False)
+    log_calls = []
+    original_log = filejob.append_convert_log
+    filejob.append_convert_log = lambda *args, **kwargs: log_calls.append(args)
+    log_path = app_dir() / 'convert-log.tsv'
+    log_before = log_path.read_bytes() if log_path.is_file() else None
+    try:
+        source_path = os.path.join(root, 'movie.mkv')
+        with open(source_path, 'wb') as handle:
+            handle.write(b'original-bytes')
+        plan = replace_plan(source_path)
+        os.makedirs(plan['hold_dir'], exist_ok=True)
+        with open(plan['temp'], 'wb') as handle:
+            handle.write(b'temporary-encode')
+        add_hold_busy_marker(plan)
+        busy = hold_busy_path(plan)
+        check(os.path.isfile(plan['temp']), 'the temp encode was not created')
+        check(os.path.isfile(busy), 'the busy marker was not created')
+        lane = Lane({})
+        item = {
+            'source': source_path, 'path': source_path, 'status': 'Converting',
+            'checked': True, 'width': 320, 'height': 240, 'target': 200, 'name': 'movie.mkv',
+        }
+        abandon_file(lane, item, 'traceback from the encode child')
+        check(not os.path.isfile(plan['temp']), 'a stopped encode left the temp file')
+        check(not os.path.isfile(busy), 'a stopped encode left the busy marker')
+        check(open(source_path, 'rb').read() == b'original-bytes', 'a stopped encode changed the original')
+        check(item['status'] == 'Failed' and item['reason'] == 'The encode stopped.', 'a stopped encode was not marked failed')
+        check(any(
+            event[0] == 'activity' and event[1] and event[1][0] == 'Failed movie.mkv. The encode stopped. The original stayed.'
+            for event in lane.events
+        ), 'a stopped encode did not say the original stayed')
+        check(log_calls and log_calls[0][0] == 'FAIL' and log_calls[0][1] == 'The encode stopped.', 'a stopped encode was not logged')
+        check(any(
+            event[0] == 'fault-call' and 'traceback from the encode child' in str(event)
+            for event in lane.events
+        ), 'a stopped encode hid the child error')
+
+        missing = os.path.join(root, 'missing-ffprobe')
+        child_row = {
+            'source': source_path, 'path': source_path, 'status': 'Bloated', 'checked': True,
+            'width': 320, 'height': 240, 'name': 'movie.mkv',
+        }
+        child = Lane({
+            'ffprobe': missing, 'ffmpeg': missing, 'handbrake': missing,
+        })
+        started = time.perf_counter()
+        holder = {}
+
+        def run_child():
+            holder['outcome'] = run_isolated_file(child, child_row)
+
+        thread = threading.Thread(target=run_child, daemon=True)
+        thread.start()
+        thread.join(15)
+        elapsed = time.perf_counter() - started
+        check(not thread.is_alive(), 'the encode child did not finish')
+        check(holder.get('outcome') is None, 'an unread file was sent back to the queue')
+        check(elapsed < 5, f'the encode child took {elapsed:.2f}s')
+        activity = [event[1][0] for event in child.events if event[0] == 'activity' and len(event) > 1 and event[1]]
+        check(any('Could not read movie.mkv' in text for text in activity), 'an unread file did not fail in the child: ' + repr(activity))
+        check(child_row['status'] == 'Failed', 'an unread file was not marked failed')
+        check(any(event[0] == 'fault' for event in child.events), 'an unread file did not report a fault')
+        check(open(source_path, 'rb').read() == b'original-bytes', 'an unread file changed the original')
+        log_after = log_path.read_bytes() if log_path.is_file() else None
+        check(log_before == log_after, 'the encode child wrote the convert log')
+    finally:
+        filejob.append_convert_log = original_log
+        recycle_mod._purge_choice = previous_purge
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_rules()
     test_duration_basis()
     test_recycle()
     test_scan_posts_events()
+    test_encode_child()
     print('SELF TEST OK')
     return 0
 
