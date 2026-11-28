@@ -7,8 +7,10 @@ import math
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1553,6 +1555,223 @@ def remove_hold_busy_marker(plan) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+def is_leftover_encode_process(pid: int, args, own_pid: int) -> bool:
+    """A previous encode still running HandBrake, or the process that started it."""
+    try:
+        number = int(pid)
+        owner = int(own_pid)
+    except (TypeError, ValueError):
+        return False
+    if number <= 0 or number == owner:
+        return False
+    arguments = [str(arg) for arg in (args or []) if arg]
+    if any('.vd.tmp.mkv' in arg for arg in arguments):
+        return True
+    return 'video_dehydrator.filejob' in ' '.join(arguments)
+
+
+def encode_output_paths(args) -> list:
+    arguments = [str(arg) for arg in (args or [])]
+    paths = []
+    for index, arg in enumerate(arguments):
+        if arg == '-o' and index + 1 < len(arguments) and '.vd.tmp.mkv' in arguments[index + 1]:
+            paths.append(arguments[index + 1])
+    return paths
+
+
+def unfinished_encode_name(name: str) -> bool:
+    lowered = str(name or '').casefold()
+    return lowered.endswith('.vd.busy') or '.vd.tmp.mkv' in lowered
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _process_arguments(pid: int):
+    if not os.path.isdir('/proc'):
+        return None
+    try:
+        raw = open(f'/proc/{pid}/cmdline', 'rb').read()
+    except OSError:
+        return None
+    return [part.decode('utf-8', 'replace') for part in raw.split(b'\x00') if part]
+
+
+def list_leftover_encode_processes(own_pid: int = 0):
+    if not os.path.isdir('/proc'):
+        return []
+    owner = int(own_pid or os.getpid())
+    found = []
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        args = _process_arguments(pid)
+        if args and is_leftover_encode_process(pid, args, owner):
+            found.append((pid, args))
+    return found
+
+
+def stop_leftover_encode_processes() -> dict:
+    """Stop encodes left behind by a window that is no longer running them."""
+    groups = {}
+    for pid, args in list_leftover_encode_processes():
+        outputs = encode_output_paths(args)
+        key = os.path.normcase(os.path.abspath(outputs[0])) if outputs else f'pid:{pid}'
+        group = groups.setdefault(key, {'pids': [], 'outputs': []})
+        group['pids'].append(pid)
+        for path in outputs:
+            if path not in group['outputs']:
+                group['outputs'].append(path)
+    if not groups:
+        return {'stopped': 0, 'outputs': [], 'alive_outputs': []}
+    for group in groups.values():
+        for pid in group['pids']:
+            _signal_pid(pid, signal.SIGTERM)
+    time.sleep(1)
+    for group in groups.values():
+        for pid in group['pids']:
+            if _pid_alive(pid):
+                _signal_pid(pid, signal.SIGKILL)
+    stopped = 0
+    outputs = []
+    alive_outputs = []
+    for group in groups.values():
+        if all(not _pid_alive(pid) for pid in group['pids']):
+            stopped += 1
+            outputs.extend(group['outputs'])
+        else:
+            alive_outputs.extend(group['outputs'])
+    return {'stopped': stopped, 'outputs': outputs, 'alive_outputs': alive_outputs}
+
+
+def _cleanup_roots(folder: str, outputs) -> list:
+    roots = []
+    if folder and os.path.isdir(folder):
+        roots.append(os.path.abspath(folder))
+    for path in outputs or []:
+        if not path:
+            continue
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.basename(parent).casefold() == '.vd-originals':
+            parent = os.path.dirname(parent)
+        if parent and os.path.isdir(parent):
+            roots.append(parent)
+    covered = []
+    for root in roots:
+        full = os.path.normcase(os.path.abspath(root))
+        if any(full == earlier or full.startswith(earlier + os.sep) for earlier in covered):
+            continue
+        covered = [earlier for earlier in covered if not earlier.startswith(full + os.sep)]
+        covered.append(full)
+    return covered
+
+
+def _guarded_unfinished_paths(paths) -> set:
+    guarded = set()
+    for path in paths or []:
+        if not path:
+            continue
+        full = os.path.abspath(path)
+        directory = os.path.dirname(full)
+        base = os.path.basename(full)
+        guarded.add(os.path.normcase(full))
+        if base.endswith('.vd.tmp.mkv'):
+            stem = base[:-len('.vd.tmp.mkv')]
+            guarded.add(os.path.normcase(os.path.join(directory, stem + '.vd.busy')))
+        if os.path.isdir(directory):
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                names = []
+            for name in names:
+                if name.startswith(base):
+                    guarded.add(os.path.normcase(os.path.join(directory, name)))
+    return guarded
+
+
+def clean_unfinished_encodes(folder: str = '', outputs=None, guarded=None) -> list:
+    """Remove half-written temps. Leave held originals in the same folder."""
+    protected = guarded if isinstance(guarded, set) else _guarded_unfinished_paths(guarded or [])
+    removed = []
+    seen = set()
+    for root in _cleanup_roots(folder, outputs):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [
+                name for name in dirnames
+                if not os.path.islink(os.path.join(dirpath, name))
+            ]
+            if os.path.basename(dirpath).casefold() != '.vd-originals':
+                continue
+            key = os.path.normcase(os.path.abspath(dirpath))
+            dirnames.clear()
+            if key in seen:
+                continue
+            seen.add(key)
+            for name in filenames:
+                if not unfinished_encode_name(name):
+                    continue
+                path = os.path.join(dirpath, name)
+                if os.path.normcase(os.path.abspath(path)) in protected:
+                    continue
+                if not os.path.isfile(path) or os.path.islink(path):
+                    continue
+                try:
+                    os.remove(path)
+                except OSError:
+                    continue
+                removed.append(path)
+            remove_empty_directory(dirpath)
+    return removed
+
+
+def recover_unfinished_encodes(folder: str = '') -> dict:
+    stopped = stop_leftover_encode_processes()
+    guarded = _guarded_unfinished_paths(stopped['alive_outputs'])
+    removed = clean_unfinished_encodes(folder, stopped['outputs'], guarded)
+    return {'stopped': stopped['stopped'], 'removed': removed}
+
+
+def recovery_note(stopped: int, removed: int) -> str:
+    try:
+        jobs = int(stopped or 0)
+        files = int(removed or 0)
+    except (TypeError, ValueError):
+        return ''
+    parts = []
+    if jobs == 1:
+        parts.append('Stopped 1 unfinished encode')
+    elif jobs > 1:
+        parts.append(f'Stopped {jobs} unfinished encodes')
+    if files == 1:
+        parts.append('removed 1 temporary file')
+    elif files > 1:
+        parts.append(f'removed {files} temporary files')
+    if not parts:
+        return ''
+    if len(parts) == 1:
+        return parts[0] + '.'
+    return parts[0] + ' and ' + parts[1] + '.'
 
 
 def remove_stale_busy_markers(directory: str) -> None:

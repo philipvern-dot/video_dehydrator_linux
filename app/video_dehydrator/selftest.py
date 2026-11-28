@@ -11,7 +11,9 @@ import time
 from .engine import (
     Probe, app_version, apply_encode_snapshot, batch_count_text, batch_wall_seconds, bloat_decision, budget_gib_per_hour, compare_versions,
     encode_row_snapshot,
-    add_hold_busy_marker, delete_targets, encode_command, handbrake_arguments, hold_busy_path,
+    add_hold_busy_marker, clean_unfinished_encodes, delete_targets, encode_command, encode_output_paths,
+    handbrake_arguments, hold_busy_path, is_leftover_encode_process, unfinished_encode_name,
+    recovery_note,
     FIND_LIMITS, job_count, linux_release_is_update, linux_update_offer, output_path_missing, pass_two_did_not_start,
     CPU_TARGETS, EncodeAdmission, cpu_target_percent, dynamic_lane_count, encoder_threads,
     safe_core_budget, split_core_budget, system_reserve, target_core_budget,
@@ -251,7 +253,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.3.2', 'app version')
+    check(app_version() == '1.1.3.3', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -887,12 +889,66 @@ def test_encode_child():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_startup_cleanup():
+    """Starting the window stops a previous encode and drops its half-written files."""
+    own = 10
+    handbrake = ['HandBrakeCLI', '-i', '/show/Episode.mkv', '-o', '/show/.vd-originals/Episode.vd.tmp.mkv']
+    check(is_leftover_encode_process(20, handbrake, own), 'a previous temp encode was left running')
+    check(not is_leftover_encode_process(own, handbrake, own), 'the running window looked like a leftover encode')
+    check(is_leftover_encode_process(21, ['python', '-u', '-m', 'video_dehydrator.filejob'], own), 'a previous file process was left running')
+    check(not is_leftover_encode_process(22, ['HandBrakeCLI', '-i', '/home/movie.mkv', '-o', '/home/movie.mkv'], own), 'another program\'s HandBrake was treated as ours')
+    check(encode_output_paths(handbrake) == ['/show/.vd-originals/Episode.vd.tmp.mkv'], 'the temp path was not read from the encode')
+    check(unfinished_encode_name('Episode.vd.tmp.mkv.stats'), 'a pass file was kept')
+    check(not unfinished_encode_name('Episode.mkv'), 'a held original looked unfinished')
+    check(recovery_note(0, 0) == '', 'an idle start reported cleanup')
+    check(recovery_note(2, 3) == 'Stopped 2 unfinished encodes and removed 3 temporary files.', 'cleanup was not reported')
+    root = tempfile.mkdtemp(prefix='vd-cleanup-')
+    try:
+        show = os.path.join(root, 'Season')
+        hold = os.path.join(show, '.vd-originals')
+        os.makedirs(hold)
+        kept = os.path.join(hold, 'Finished.mkv')
+        original = os.path.join(show, 'Episode.mkv')
+        temp = os.path.join(hold, 'Episode.vd.tmp.mkv')
+        stats = temp + '.stats'
+        busy = os.path.join(hold, 'Episode.vd.busy')
+        outside = os.path.join(show, 'Episode.vd.tmp.mkv')
+        for path in (kept, original, temp, stats, busy, outside):
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('x')
+        guarded = {os.path.normcase(os.path.abspath(os.path.join(hold, 'Live.vd.tmp.mkv')))}
+        live = os.path.join(hold, 'Live.vd.tmp.mkv')
+        with open(live, 'w', encoding='utf-8') as handle:
+            handle.write('still')
+        removed = clean_unfinished_encodes(root, None, guarded)
+        check(not os.path.exists(temp), 'a half-written encode stayed')
+        check(not os.path.exists(stats), 'a pass file stayed')
+        check(not os.path.exists(busy), 'a busy marker stayed')
+        check(os.path.isfile(kept), 'a held original was removed')
+        check(os.path.isfile(original), 'a show file was removed')
+        check(os.path.isfile(outside), 'a file outside the holding folder was removed')
+        check(os.path.isfile(live), 'an encode that was still running was removed')
+        check(os.path.isdir(hold), 'the holding folder was removed while an original remained')
+        check(all(path != live for path in removed), 'a live temp was counted as removed')
+        empty_show = os.path.join(root, 'Empty')
+        empty_hold = os.path.join(empty_show, '.vd-originals')
+        os.makedirs(empty_hold)
+        with open(os.path.join(empty_hold, 'Gone.vd.tmp.mkv'), 'w', encoding='utf-8') as handle:
+            handle.write('x')
+        clean_unfinished_encodes(root)
+        check(not os.path.isdir(empty_hold), 'an empty holding folder stayed')
+        check(os.path.isfile(kept), 'a later cleanup removed a held original')
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_rules()
     test_duration_basis()
     test_recycle()
     test_scan_posts_events()
     test_encode_child()
+    test_startup_cleanup()
     print('SELF TEST OK')
     return 0
 

@@ -44,7 +44,7 @@ from .engine import (
     mean_sample, median_sample, merge_skip_row, missing_tools, nearest_budget_anchor,
     make_fault_record, merge_fault,
     over_band_id, over_ratio, pixel_seconds, probe_file, remaining_estimate,
-    remembered_skip, remove_kept_original, remove_skip_row,
+    remembered_skip, recover_unfinished_encodes, recovery_note, remove_kept_original, remove_skip_row,
     scan_limit_reached, set_budget_picks,
     space_saved_bytes, target_kbps, undo_replaced_file,
 )
@@ -3067,7 +3067,12 @@ def main():
     app = QApplication([])
     app.setStyle('Fusion')
     app.setStyleSheet(indicator_style())
+    folder = str(load_settings().get('folder') or '')
+    recovery = recover_unfinished_encodes(folder)
     window = MainWindow()
+    note = recovery_note(recovery['stopped'], len(recovery['removed']))
+    if note:
+        window.log(note, 'text')
     window.show()
     QThread.currentThread()
     app.aboutToQuit.connect(window.awake.stop)
