@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import html
 import math
 import os
@@ -307,8 +308,8 @@ class ConvertWorker(threading.Thread):
 
     Each file runs in its own Python process. A native crash in that process
     stops the file and the batch keeps going. Progress is posted on a queue.
-    The window applies it. This is a normal Python thread. A Qt thread crashed
-    the interpreter during long batches.
+    The window applies it. This is a normal Python thread. Collection stays
+    on the window thread, because a collection from this thread faults.
     """
 
     def __init__(self, rows, tools, reencode, delete_original, detailed, skips, cancel, force=False, jobs=1, dynamic=False, cpu_target=100, node_cores=None):
@@ -1003,6 +1004,21 @@ class MainWindow(QMainWindow):
             self.log('Scan lists videos that are too big for their picture size. The Budgets row starts on Recommended.', 'text')
         self._refresh_fault_button()
         self.status.setText('Ready')
+        self._install_window_gc()
+
+    def _install_window_gc(self):
+        # Automatic collection runs on whichever thread is executing Python.
+        # From an encode lane, that walk faults inside a PySide object.
+        # This timer is owned by the window, so collection stays here.
+        gc.disable()
+        gc.collect()
+        self._gc_timer = QTimer(self)
+        self._gc_timer.setInterval(5000)
+        self._gc_timer.timeout.connect(self._collect_garbage)
+        self._gc_timer.start()
+
+    def _collect_garbage(self):
+        gc.collect()
 
     def _build(self):
         page = QWidget()

@@ -251,7 +251,7 @@ def test_rules():
     }
     check(linux_update_offer(elsewhere, '1.0.9.5') is None, 'an archive from another site is not installed')
     check(clean_column_widths({'File': 220, 'Size': 'wide', 'Tiny': 10}) == {'File': 220}, 'column widths keep real sizes')
-    check(app_version() == '1.1.3.1', 'app version')
+    check(app_version() == '1.1.3.2', 'app version')
     window_row = {'source': '/shows/Episode.mkv', 'path': '/shows/Episode.mkv', 'status': 'Bloated', 'audio': ['aac']}
     worker_row = encode_row_snapshot(window_row)
     worker_row['status'] = 'Converting'
@@ -671,6 +671,16 @@ def test_encode_child():
     body_text = '\n'.join(body)
     check('run_isolated_file(self, row)' in body_text, 'convert_row does not use the encode child')
     check('probe_file' not in body_text and 'handbrake' not in body_text.lower(), 'convert_row still encodes in the window')
+    gc_method = window.split('def _install_window_gc(', 1)[1]
+    gc_body = []
+    for line in gc_method.splitlines()[1:]:
+        if line.startswith('    def ') or line.startswith('class '):
+            break
+        gc_body.append(line)
+    gc_text = '\n'.join(gc_body)
+    check('gc.disable()' in gc_text and 'gc.collect()' in gc_text, 'the window still collects automatically')
+    check('_gc_timer' in gc_text and '5000' in gc_text, 'collection is not on the window timer')
+    check('gc.freeze' not in window, 'the window freezes the collector')
 
     probe = Probe(width=320, height=240, path='movie.mkv')
     row = {'source': 'movie.mkv', 'path': 'movie.mkv', 'status': 'Bloated', 'probe': probe}
